@@ -1,0 +1,7 @@
+.DS_Store
+venv/
+__pycache__/
+*.mp4
+runs/
+preview/
+Final_Car_Accident_DataSet.v1-yolo8.yolov8/
