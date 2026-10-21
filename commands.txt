@@ -1,0 +1,2 @@
+rm -rf preview && python main.py "/Users/vladislavgerzatovich/Downloads/ДОРОГА.mp4.mp4" --save-preview preview --save-video result_video.mp4 --output result.json
+python3 main.py dtp.mp4 --weights runs/detect/train/weights/accident_dtp.pt
