@@ -8,10 +8,17 @@
 
 Запуск:
   python main.py                          # окно выбора файла
-  python main.py video.mp4                # файл
+  python main.py video.mp4                # файл; видео с рамками сохранится
+                                          # рядом как <имя>_detected.mp4
+  python main.py video.mp4 --smooth-video # рамки на каждом кадре (дольше, плавнее)
+  python main.py video.mp4 --no-video     # не сохранять видео
+  python main.py video.mp4 --weights road_all.pt   # единая модель: люди, машины, знаки
+                                          # (road_all.pt рядом с main.py берётся сам)
   python main.py video.mp4 --step 0.5 --save-preview preview
   python main.py video.mp4 --save-video result_video.mp4
   python main.py video.mp4 --no-detect    # только проверить загрузку видео
+  python main.py video.mp4 --accident-weights best.pt   # + модель ДТП
+  python main.py video.mp4 --accident-weights best.pt --accident-conf 0.3
 
   python main.py --camera                 # камера №0 (встроенная)
   python main.py --camera 1               # камера №1 (внешняя USB)
@@ -40,7 +47,15 @@ from pathlib import Path
 
 import cv2
 
+try:  # анализ сцены (треки, движение, события, сводка для LLM): файл лежит рядом с main.py
+    from scene_analysis import SceneAnalyzer
+except ImportError:
+    SceneAnalyzer = None
+
 WINDOW = "SceneVision (q / Esc - exit)"
+# Классы COCO, нужные для дорожной сцены (остальные 70+ классов только шумят).
+ROAD_COCO_NAMES = {"person", "bicycle", "car", "motorcycle", "bus", "truck",
+                   "traffic light", "stop sign"}
 STALL_SEC = 2.0          # столько секунд без новых кадров = «нет сигнала»
 MAX_RECONNECTS = 10      # сколько раз подряд пробуем переподключиться
 RTSP_TIMEOUT_MS = 8000   # таймаут открытия и чтения RTSP, мс
@@ -260,8 +275,8 @@ class DetectionWorker:
     когда результат предыдущей уже забран через poll().
     """
 
-    def __init__(self, model, conf: float, want_plot: bool = False):
-        self._model = model
+    def __init__(self, detectors: Detectors, conf: float, want_plot: bool = False):
+        self._detectors = detectors
         self._conf = conf
         self._want_plot = want_plot
         self._cv = threading.Condition()
@@ -285,9 +300,10 @@ class DetectionWorker:
                 frame, t = self._job
                 self._job = None
             try:
-                objects, result = detect(self._model, frame, self._conf)
-                plot = result.plot() if self._want_plot else None
-                out = (t, objects, plot)
+                objects, events, result = detect_all(
+                    self._detectors, frame, self._conf)
+                plot = draw_objects(frame.copy(), objects, events) if self._want_plot else None
+                out = (t, objects, events, plot)
             except Exception as exc:  # передаём ошибку в основной поток
                 out = exc
             with self._cv:
@@ -303,7 +319,7 @@ class DetectionWorker:
             return True
 
     def poll(self):
-        """Готовый результат (t, objects, plot), исключение или None."""
+        """Готовый результат (t, objects, events, plot), исключение или None."""
         with self._cv:
             if self._done is None:
                 return None
@@ -360,15 +376,29 @@ class PacedVideoWriter:
 
 # --------------------------------------------------------------- отрисовка
 
-def draw_objects(frame, objects):
-    """Рисует рамки и подписи на кадре (для видео с результатом)."""
-    for o in objects:
-        x1, y1, x2, y2 = (int(v) for v in o["bbox"])
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
-        label = f"{o['class']} {o['confidence']:.2f}"
-        cv2.putText(frame, label, (x1, max(12, y1 - 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1, cv2.LINE_AA)
+def draw_objects(frame, objects, events=()):
+    """Рисует рамки и подписи на кадре (для видео с результатом).
+
+    Объекты - зелёным, события (ДТП) - красным и потолще.
+    """
+    for items, color, thick in ((objects, (0, 220, 0), 2),
+                                (events, (0, 0, 255), 3)):
+        for o in items:
+            x1, y1, x2, y2 = (int(v) for v in o["bbox"])
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+            label = f"{o['class']} {o['confidence']:.2f}"
+            cv2.putText(frame, label, (x1, max(12, y1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    if events:
+        cv2.putText(frame, "ACCIDENT", (10, 32), cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0, (0, 0, 255), 3, cv2.LINE_AA)
     return frame
+
+
+def plot_with_events(result, events):
+    """Кадр с рамками модели объектов (Ultralytics) + красные рамки событий."""
+    plot = result.plot()
+    return draw_objects(plot, [], events) if events else plot
 
 
 def window_closed() -> bool:
@@ -387,9 +417,56 @@ def load_model(weights: str):
     return YOLO(weights)
 
 
-def detect(model, frame, conf: float):
+class Detectors:
+    """Основной детектор объектов + необязательная модель ДТП.
+
+    Модель ДТП обучена на одном классе (car-accident) и работает независимо:
+    её результаты идут в отдельное поле events, а не смешиваются с objects.
+    """
+
+    def __init__(self, objects_model, accident_model=None,
+                 accident_conf: float = 0.4, road_model=None,
+                 road_conf: float = 0.4, objects_classes=None):
+        self.objects = objects_model
+        self.accident = accident_model
+        self.accident_conf = accident_conf
+        self.road = road_model              # знаки, переходы (необязательно)
+        self.road_conf = road_conf
+        self.objects_classes = objects_classes  # id классов основной модели
+
+
+def coco_road_ids(model):
+    """Для обычной COCO-модели (80 классов): id только дорожных классов.
+
+    Для вашей собственной модели (иное число классов) ограничения нет.
+    """
+    names = model.names
+    if len(names) != 80:
+        return None
+    return [i for i, n in names.items() if n in ROAD_COCO_NAMES]
+
+
+def load_detectors(args) -> Detectors:
+    objects_model = load_model(args.weights)
+    accident_model = None
+    if args.accident_weights:
+        if not Path(args.accident_weights).exists():
+            raise RuntimeError(
+                f"Файл весов ДТП не найден: {args.accident_weights}")
+        accident_model = load_model(args.accident_weights)
+    road_model = None
+    if args.road_weights:
+        if not Path(args.road_weights).exists():
+            raise RuntimeError(f"Файл весов знаков/переходов не найден: {args.road_weights}")
+        road_model = load_model(args.road_weights)
+    classes = None if args.all_coco else coco_road_ids(objects_model)
+    return Detectors(objects_model, accident_model, args.accident_conf,
+                     road_model, args.road_conf, classes)
+
+
+def detect(model, frame, conf: float, classes=None):
     """Возвращает (список объектов, результат Ultralytics для отрисовки)."""
-    result = model(frame, conf=conf, verbose=False)[0]
+    result = model(frame, conf=conf, classes=classes, verbose=False)[0]
     objects = []
     for box in result.boxes:
         cls_id = int(box.cls[0])
@@ -403,32 +480,83 @@ def detect(model, frame, conf: float):
     return objects, result
 
 
-def make_record(index: int, t: float, objects: list) -> dict:
+def detect_events(detectors: Detectors, frame):
+    """События (ДТП) на кадре: список в том же формате, что и объекты."""
+    if detectors.accident is None:
+        return []
+    events, _ = detect(detectors.accident, frame, detectors.accident_conf)
+    return events
+
+
+def detect_all(detectors: Detectors, frame, conf: float):
+    """Обе модели на одном кадре: (объекты, события, результат для отрисовки)."""
+    objects, result = detect(detectors.objects, frame, conf, detectors.objects_classes)
+    if detectors.road is not None:      # знаки и переходы: те же объекты, другая модель
+        road_objects, _ = detect(detectors.road, frame, detectors.road_conf)
+        objects = objects + road_objects
+    return objects, detect_events(detectors, frame), result
+
+
+def make_record(index: int, t: float, objects: list, events: list = ()) -> dict:
     """Запись об одном проанализированном кадре (одинаковая для всех источников)."""
     return {"frame_index": index, "time_sec": t,
             "summary": dict(Counter(o["class"] for o in objects)),
-            "objects": objects}
+            "objects": objects,
+            "events": list(events)}
 
 
-def save_result(args, source_name, source_type, info, frames_out, totals):
+def make_analyzer(args):
+    """Анализатор сцены или None, если он отключён (--no-analysis) или не найден."""
+    if args.no_analysis:
+        return None
+    if SceneAnalyzer is None:
+        print("Предупреждение: scene_analysis.py не найден рядом с main.py, "
+              "расширенный JSON отключён.")
+        return None
+    return SceneAnalyzer(lang=args.lang, track_gap=args.track_gap)
+
+
+def save_result(args, source_name, source_type, info, frames_out, totals, analyzer=None):
+    event_totals = Counter(e["class"] for f in frames_out for e in f["events"])
+    video = {"file": source_name, "source_type": source_type, **info}
     data = {
-        "video": {"file": source_name, "source_type": source_type, **info},
-        "settings": {"step_sec": args.step, "weights": args.weights, "conf": args.conf},
-        "frames": frames_out,
-        "totals": dict(totals),
+        "schema_version": 2 if analyzer else 1,
+        "video": video,
+        "settings": {"step_sec": args.step, "weights": args.weights, "conf": args.conf,
+                     "accident_weights": args.accident_weights,
+                     "accident_conf": args.accident_conf,
+                     "road_weights": args.road_weights,
+                     "road_conf": args.road_conf,
+                     "language": args.lang if analyzer else None},
     }
+    digest = None
+    if analyzer is not None:
+        analysis = analyzer.finalize(video, args.digest_every, args.digest_events)
+        data["scene"] = analysis["scene"]        # сводка по всему видео
+        data["timeline"] = analysis["timeline"]  # события по времени с готовым описанием
+        data["tracks"] = analysis["tracks"]      # «биография» каждого объекта
+        digest = analysis["digest"]
+    data["frames"] = frames_out
+    data["totals"] = dict(totals)
+    data["event_totals"] = dict(event_totals)
     Path(args.output).write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if digest is not None:
+        digest_path = Path(args.output).with_name(Path(args.output).stem + "_llm.json")
+        digest_path.write_text(json.dumps(digest, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Сводка для LLM: {digest_path} ({digest_path.stat().st_size // 1024 or 1} КБ)")
     print(f"\nГотово. Проанализировано кадров: {len(frames_out)}")
     print(f"Всего найдено: {dict(totals)}")
+    if args.accident_weights:
+        print(f"События (кадров с ДТП): {dict(event_totals)}")
     print(f"Результат сохранён: {args.output}")
 
 
 # ------------------------------------------------------------ режим: файл
 
 def run_file(args, cap, info, source_name):
-    model = load_model(args.weights)
+    detectors = load_detectors(args)
     preview_dir = Path(args.save_preview) if args.save_preview else None
     if preview_dir:
         preview_dir.mkdir(parents=True, exist_ok=True)
@@ -438,39 +566,52 @@ def run_file(args, cap, info, source_name):
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(args.save_video, fourcc, info["fps"] or 25.0,
                                  (info["width"], info["height"]))
+        if not writer.isOpened():
+            raise RuntimeError(f"Не удалось создать файл видео: {args.save_video}")
+        print(f"Видео с рамками будет сохранено: {args.save_video}")
 
     frames_out = []
     totals = Counter()
+    analyzer = make_analyzer(args)
     last_objects = []  # рамки с последнего анализируемого кадра (держим до следующего)
+    last_events = []
     for index, t, frame, analyze in iter_frames(cap, info["fps"], args.step):
         if analyze:
-            objects, result = detect(model, frame, args.conf)
-            last_objects = objects
-            record = make_record(index, t, objects)
+            objects, events, result = detect_all(detectors, frame, args.conf)
+            last_objects, last_events = objects, events
+            record = make_record(index, t, objects, events)
+            if analyzer:
+                analyzer.process(record, (info["width"], info["height"]))
             totals.update(record["summary"])
             frames_out.append(record)
-            print(f"  t={t:>7.2f} c  объектов: {len(objects):<3} {record['summary']}")
+            mark = f"  ДТП: {len(events)}" if events else ""
+            print(f"  t={t:>7.2f} c  объектов: {len(objects):<3} "
+                  f"{record['summary']}{mark}")
             if preview_dir:
-                cv2.imwrite(str(preview_dir / f"frame_{index:06d}.jpg"), result.plot())
+                cv2.imwrite(str(preview_dir / f"frame_{index:06d}.jpg"),
+                            draw_objects(frame.copy(), objects, events))
+        elif writer and args.smooth_video:
+            # плавное видео: детекция на каждом кадре (JSON при этом по шагу)
+            last_objects, last_events, _ = detect_all(detectors, frame, args.conf)
         if writer:
-            writer.write(draw_objects(frame, last_objects))
+            writer.write(draw_objects(frame, last_objects, last_events))
     if writer:
         writer.release()
-        print(f"Видео с рамками сохранено: {args.save_video}")
+        print(f"Видео с рамками сохранено: {Path(args.save_video).resolve()}")
     cap.release()
 
-    save_result(args, source_name, "file", info, frames_out, totals)
+    save_result(args, source_name, "file", info, frames_out, totals, analyzer)
 
 
 # ------------------------------------------- режим: камера и RTSP (живой поток)
 
-def run_live(args, model, cap, reopen, info, source_name, source_type):
+def run_live(args, detectors, cap, reopen, info, source_name, source_type):
     """Общий цикл для веб-камеры и RTSP.
 
-    model=None означает режим --no-detect: только показ (и запись видео).
+    detectors=None означает режим --no-detect: только показ (и запись видео).
     reopen - функция переоткрытия источника (None = не переподключаться).
     """
-    detecting = model is not None
+    detecting = detectors is not None
     preview_dir = Path(args.save_preview) if args.save_preview else None
     if preview_dir:
         preview_dir.mkdir(parents=True, exist_ok=True)
@@ -478,14 +619,16 @@ def run_live(args, model, cap, reopen, info, source_name, source_type):
     journal_path = Path(args.output).with_suffix(".jsonl")
     journal = open(journal_path, "w", encoding="utf-8") if detecting else None
     reader = LatestFrameReader(cap, reopen).start()
-    worker = DetectionWorker(model, args.conf, bool(preview_dir)).start() \
+    worker = DetectionWorker(detectors, args.conf, bool(preview_dir)).start() \
         if detecting else None
     writer = PacedVideoWriter(args.save_video, args.video_fps) \
         if args.save_video else None
 
     frames_out = []
     totals = Counter()
+    analyzer = make_analyzer(args) if detecting else None
     last_objects = []
+    last_events = []
     index = 0        # порядковый номер завершённого анализа
     next_t = 0.0     # когда делать следующий анализ (сек от старта)
     last_seq = -1    # номер последнего отправленного на анализ кадра
@@ -524,15 +667,18 @@ def run_live(args, model, cap, reopen, info, source_name, source_type):
                 if isinstance(done, Exception):
                     raise done
                 if done is not None:
-                    t, objects, plot = done
-                    last_objects = objects
-                    record = make_record(index, t, objects)
+                    t, objects, events, plot = done
+                    last_objects, last_events = objects, events
+                    record = make_record(index, t, objects, events)
+                    if analyzer:
+                        analyzer.process(record, (info["width"], info["height"]))
                     totals.update(record["summary"])
                     frames_out.append(record)
                     journal.write(json.dumps(record, ensure_ascii=False) + "\n")
                     journal.flush()  # данные на диске сразу, а не при закрытии
+                    mark = f"  ДТП: {len(events)}" if events else ""
                     print(f"  t={t:>7.2f} c  объектов: {len(objects):<3} "
-                          f"{record['summary']}")
+                          f"{record['summary']}{mark}")
                     if preview_dir and plot is not None:
                         cv2.imwrite(str(preview_dir / f"frame_{index:06d}.jpg"), plot)
                     index += 1
@@ -542,7 +688,7 @@ def run_live(args, model, cap, reopen, info, source_name, source_type):
                         next_t = elapsed + args.step  # от «сейчас», без накопления очереди
                         last_seq = seq
 
-            annotated = draw_objects(frame.copy(), last_objects)
+            annotated = draw_objects(frame.copy(), last_objects, last_events)
             if stalled:
                 cv2.putText(annotated, "NO SIGNAL - reconnecting", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
@@ -574,7 +720,7 @@ def run_live(args, model, cap, reopen, info, source_name, source_type):
         if detecting and frames_out:
             info = {**info, "duration_sec": round(time.monotonic() - start, 2),
                     "reconnects": reader.reconnects}
-            save_result(args, source_name, source_type, info, frames_out, totals)
+            save_result(args, source_name, source_type, info, frames_out, totals, analyzer)
             print(f"Журнал по ходу работы: {journal_path}")
 
 
@@ -594,10 +740,23 @@ def main() -> int:
                              "rtsp://user:pass@192.168.1.10:554/stream")
     parser.add_argument("--step", type=float, default=1.0,
                         help="шаг между анализируемыми кадрами, сек (по умолчанию 1.0)")
-    parser.add_argument("--weights", default="C:\\Users\\Furia\\runs\\detect\\train\\weights\\accident_dtp.pt",
-                        help="веса YOLO (по умолчанию yolov8n.pt, самая лёгкая)")
+    parser.add_argument("--weights", default=None,
+                        help="веса YOLO (по умолчанию road_all.pt рядом с main.py, "
+                             "а если его нет, обычная yolov8n.pt)")
     parser.add_argument("--conf", type=float, default=0.4,
                         help="порог уверенности детекции (по умолчанию 0.4)")
+    parser.add_argument("--accident-weights", metavar="FILE",
+                        help="веса модели ДТП (необязательно; по умолчанию "
+                             "модель ДТП не используется)")
+    parser.add_argument("--road-weights", metavar="FILE",
+                        help="веса модели знаков и пешеходных переходов "
+                             "(например, road_signs.pt); работает вместе с основной")
+    parser.add_argument("--road-conf", type=float, default=0.4,
+                        help="порог уверенности для знаков/переходов (по умолчанию 0.4)")
+    parser.add_argument("--all-coco", action="store_true",
+                        help="не ограничивать COCO-модель дорожными классами")
+    parser.add_argument("--accident-conf", type=float, default=0.4,
+                        help="порог уверенности для ДТП (по умолчанию 0.4)")
     parser.add_argument("--output", default="result.json", help="файл с результатом")
     parser.add_argument("--save-preview", metavar="DIR",
                         help="папка для сохранения кадров с рамками")
@@ -606,9 +765,35 @@ def main() -> int:
     parser.add_argument("--video-fps", type=float, default=25.0,
                         help="частота кадров сохраняемого видео для камеры/RTSP "
                              "(по умолчанию 25)")
+    parser.add_argument("--no-video", action="store_true",
+                        help="для видеофайла не сохранять видео с рамками "
+                             "(по умолчанию сохраняется <имя>_detected.mp4)")
+    parser.add_argument("--smooth-video", action="store_true",
+                        help="в сохраняемом видео детектировать КАЖДЫЙ кадр "
+                             "(рамки следуют за объектами, но дольше)")
+    parser.add_argument("--no-analysis", action="store_true",
+                        help="не добавлять в JSON треки, движение и события (простой JSON)")
+    parser.add_argument("--lang", choices=("ru", "en"), default="ru",
+                        help="язык готовых описаний событий в JSON (по умолчанию ru)")
+    parser.add_argument("--track-gap", type=float, default=2.5,
+                        help="сколько секунд помнить пропавший объект при слежении (по умолчанию 2.5)")
+    parser.add_argument("--digest-every", type=float, default=5.0,
+                        help="длина отрезка в сводке для LLM, сек (по умолчанию 5)")
+    parser.add_argument("--digest-events", type=int, default=120,
+                        help="сколько событий максимум класть в сводку для LLM (по умолчанию 120)")
     parser.add_argument("--no-detect", action="store_true",
                         help="только загрузка видео/подключение без детекции")
     args = parser.parse_args()
+
+    # Единая модель (люди, машины, знаки) подключается сама, если лежит рядом
+    if not args.weights:
+        unified = Path(__file__).resolve().with_name("road_all.pt")
+        if unified.exists():
+            args.weights = str(unified)
+            print("Найдена единая модель road_all.pt (люди, машины, знаки): "
+                  "используется она.")
+        else:
+            args.weights = "yolov8n.pt"
 
     chosen = [args.video is not None, args.camera is not None, args.rtsp is not None]
     if sum(chosen) > 1:
@@ -620,7 +805,7 @@ def main() -> int:
         # ---- камера и RTSP
         if args.camera is not None or args.rtsp:
             # модель грузим до подключения: чтобы соединение не простаивало
-            model = None if args.no_detect else load_model(args.weights)
+            detectors = None if args.no_detect else load_detectors(args)
             if args.camera is not None:
                 cap = open_camera(args.camera, args.cam_width, args.cam_height)
                 reopen, source_type = None, "camera"
@@ -633,7 +818,7 @@ def main() -> int:
                 source_name = mask_url(url)
                 print(f"RTSP: {source_name}")
             info = live_info(cap)
-            run_live(args, model, cap, reopen, info, source_name, source_type)
+            run_live(args, detectors, cap, reopen, info, source_name, source_type)
             return 0
 
         # ---- видеофайл
@@ -654,6 +839,8 @@ def main() -> int:
             cap.release()
             return 0
 
+        if not args.save_video and not args.no_video:
+            args.save_video = str(Path(path).with_name(Path(path).stem + "_detected.mp4"))
         run_file(args, cap, info, Path(path).name)
         return 0
     except RuntimeError as exc:
