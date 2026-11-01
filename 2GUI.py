@@ -1,16 +1,18 @@
-"""SceneVision GUI — polished desktop interface for the current prototype.
+"""SceneVision GUI — interface for the existing main.py + scene_analysis.py.
 
-Place this file in the same directory as main.py and run:
-    python scenevision_gui.py
+Keep this file beside the existing main.py and scene_analysis.py, then run:
+    python 2GUI.py
 
-The interface currently uses the existing detector and record format from main.py.
-Qwen2.5 generation and the final JSON contract are intentionally not implemented here.
+This file is the GUI adapter only. It does not modify the processing modules.
 """
 from __future__ import annotations
 
 import math
 import sys
 import time
+import json
+from types import SimpleNamespace
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -27,10 +29,11 @@ from PyQt5.QtWidgets import (
     QSpinBox, QSizePolicy, QSpacerItem,
 )
 
+import main as pipeline
 from main import (
-    load_model, detect, make_record,
-    open_video, open_camera, open_rtsp, video_info,
-    LatestFrameReader, iter_frames,
+    load_model, detect_all, make_record, load_detectors, make_analyzer,
+    open_video, open_camera, open_rtsp, video_info, live_info,
+    LatestFrameReader, iter_frames, save_result,
 )
 
 
@@ -294,13 +297,20 @@ class ModelLoadThread(QThread):
     loaded = pyqtSignal(object, str)
     failed = pyqtSignal(str)
 
-    def __init__(self, weights: str, parent=None):
+    def __init__(self, weights: str, parent=None, accident_weights="", road_weights=""):
         super().__init__(parent)
         self.weights = weights
+        self.accident_weights = accident_weights.strip() or None
+        self.road_weights = road_weights.strip() or None
 
     def run(self):
         try:
-            self.loaded.emit(load_model(self.weights), self.weights)
+            args = SimpleNamespace(
+                weights=self.weights, accident_weights=self.accident_weights,
+                road_weights=self.road_weights, accident_conf=0.4, road_conf=0.4,
+                all_coco=False,
+            )
+            self.loaded.emit(load_detectors(args), self.weights)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -316,128 +326,85 @@ class VideoThread(QThread):
     stage_changed = pyqtSignal(int)
     failed = pyqtSignal(str)
 
-    def __init__(self, source_type, source, model, conf=0.4, step=1.0, parent=None):
+    def __init__(self, source_type, source, detectors, conf=0.4, step=1.0,
+                 weights="yolov8n.pt", accident_weights="", road_weights="", parent=None):
         super().__init__(parent)
-        self.source_type = source_type
-        self.source = source
-        self.model = model
-        self.conf = conf
-        self.step = step
+        self.source_type, self.source = source_type, source
+        self.detectors, self.conf, self.step = detectors, float(conf), max(float(step), 0.05)
+        self.weights = weights
+        self.accident_weights = accident_weights or None
+        self.road_weights = road_weights or None
         self._running = False
-        self._cap = None
-        self._reader = None
-        self.error_message = ""
+        self.result_json = ""
+        self.llm_json = ""
+        self.analysis_data = {}
 
     def run(self):
         self._running = True
-        self.stage_changed.emit(0)  # этап 1: открытие и чтение источника
+        cap = None
         try:
-            if self.source_type == "file":
-                self._run_file()
-            else:
-                self._run_live(self.source_type)
-        except Exception as exc:
-            self.error_message = str(exc)
-            self.failed.emit(self.error_message)
-            self.progress_updated.emit(0, f"Ошибка: {exc}")
-        finally:
-            self._cleanup()
-
-    def _run_file(self):
-        cap = open_video(self.source)
-        self._cap = cap
-        info = video_info(cap)
-        self.stage_changed.emit(1)  # источник открыт: начинается детекция
-        duration = info.get("duration_sec") or 0
-        total_steps = max(1, math.ceil(duration / max(self.step, 0.001)))
-        analyzed_count = 0
-        try:
+            self.stage_changed.emit(0)
+            if self.source_type != "file":
+                raise RuntimeError("В этой версии GUI интегрирован анализ видеофайлов. Камеру и RTSP подключим следующим этапом.")
+            cap = open_video(self.source)
+            info = video_info(cap)
+            self.stage_changed.emit(1)
+            analyzer_args = SimpleNamespace(no_analysis=False, lang="ru", track_gap=2.5)
+            analyzer = make_analyzer(analyzer_args)
+            records, totals = [], Counter()
+            duration = info.get("duration_sec") or 0
+            total_steps = max(1, math.ceil(duration / self.step))
             for index, timestamp, frame, analyze in iter_frames(cap, info["fps"], self.step):
                 if not self._running or self.isInterruptionRequested():
                     break
                 if not analyze:
                     continue
-                objects, _ = detect(self.model, frame, self.conf)
-                record = make_record(index, timestamp, objects)
-                annotated = draw_objects_ru(frame.copy(), objects)
+                objects, events, _ = detect_all(self.detectors, frame, self.conf)
+                record = make_record(index, timestamp, objects, events)
+                if analyzer is not None:
+                    record = analyzer.process(record, size=(info["width"], info["height"]))
+                records.append(record)
+                totals.update(record.get("summary", {}))
+                annotated = pipeline.draw_objects(frame.copy(), objects, events)
                 self.record_ready.emit(record, annotated.copy())
-                self.stage_changed.emit(2)  # первая запись результата сформирована
                 self.frame_ready.emit(annotated)
-                analyzed_count += 1
-                progress = min(100, int(analyzed_count * 100 / total_steps))
-                summary = ", ".join(
-                    f"{CLASS_RU.get(name, name)}: {count}"
-                    for name, count in record.get("summary", {}).items()
-                ) or "объектов нет"
-                self.progress_updated.emit(
-                    progress, f"{timestamp:07.2f} с  ·  {summary}"
-                )
-                self.msleep(8)
-        finally:
+                progress = min(99, int(len(records) * 100 / total_steps))
+                summary = ", ".join(f"{CLASS_RU.get(k, k)}: {v}" for k, v in record.get("summary", {}).items()) or "объектов нет"
+                self.progress_updated.emit(progress, f"{timestamp:07.2f} с  ·  {summary}")
+                self.stage_changed.emit(2)
+                self.msleep(5)
             cap.release()
-            self._cap = None
-
-    def _run_live(self, kind):
-        if kind == "camera":
-            cap = open_camera(int(self.source))
-            reopen = None
-        else:
-            cap = open_rtsp(self.source)
-            reopen = lambda: open_rtsp(self.source)
-        self._cap = cap
-        self._reader = LatestFrameReader(cap, reopen).start()
-        self.stage_changed.emit(1)  # источник открыт: начинается детекция
-        self.progress_updated.emit(0, f"Подключено: {kind}")
-        last_seq = -1
-        next_analysis = 0.0
-        start = time.monotonic()
-        index = 0
-        last_objects = []
-        try:
-            while self._running and not self.isInterruptionRequested():
-                now = time.monotonic()
-                snapshot = self._reader.snapshot()
-                if snapshot is None:
-                    if not self._reader.alive:
-                        break
-                    self.msleep(20)
-                    continue
-                frame, seq, received_at = snapshot
-                if seq != last_seq and (now - start) >= next_analysis:
-                    elapsed = now - start
-                    objects, _ = detect(self.model, frame, self.conf)
-                    last_objects = objects
-                    record = make_record(index, round(elapsed, 2), objects)
-                    annotated = draw_objects_ru(frame.copy(), objects)
-                    self.record_ready.emit(record, annotated.copy())
-                    self.stage_changed.emit(2)  # первая запись результата сформирована
-                    self.frame_ready.emit(annotated)
-                    index += 1
-                    last_seq = seq
-                    next_analysis = elapsed + max(self.step, 0.1)
-                    summary = ", ".join(
-                        f"{CLASS_RU.get(name, name)}: {count}"
-                        for name, count in record.get("summary", {}).items()
-                    ) or "объектов нет"
-                    self.progress_updated.emit(0, f"{elapsed:07.2f} с  ·  {summary}")
-                else:
-                    self.frame_ready.emit(draw_objects_ru(frame.copy(), last_objects))
-                self.msleep(25)
+            cap = None
+            if records:
+                output = str(Path(self.source).with_name(Path(self.source).stem + "_result.json"))
+                args = SimpleNamespace(
+                    output=output, step=self.step, weights=self.weights,
+                    conf=self.conf, accident_weights=self.accident_weights,
+                    accident_conf=self.detectors.accident_conf,
+                    road_weights=self.road_weights,
+                    road_conf=self.detectors.road_conf, lang="ru", digest_every=5.0,
+                    digest_events=120,
+                )
+                self.stage_changed.emit(3)
+                save_result(args, Path(self.source).name, "file", info, records, totals, analyzer)
+                self.result_json = output
+                self.llm_json = str(Path(output).with_name(Path(output).stem + "_llm.json"))
+                try:
+                    self.analysis_data = json.loads(Path(output).read_text(encoding="utf-8"))
+                except Exception:
+                    self.analysis_data = {}
+                self.progress_updated.emit(100, f"Готово. JSON: {Path(output).name}")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            self.progress_updated.emit(0, f"Ошибка: {exc}")
         finally:
-            pass
+            if cap is not None:
+                cap.release()
 
     def stop(self):
         self._running = False
         self.requestInterruption()
-        self.wait(4000)
-
-    def _cleanup(self):
-        if self._reader:
-            self._reader.stop()
-            self._reader = None
-        if self._cap:
-            self._cap.release()
-            self._cap = None
+        self.wait(10000)
 
 
 class ExportThread(QThread):
@@ -823,7 +790,7 @@ class PageProcessing(QWidget):
             ("01", "Чтение видео", "Получение кадров из источника"),
             ("02", "Детекция объектов", "Анализ кадров моделью YOLO"),
             ("03", "Структурирование", "Подготовка записей результатов"),
-            ("04", "Текстовое описание", "LLM будет подключена позже"),
+            ("04", "Подготовка данных для LLM", "Формирование digest для Qwen2.5"),
         ]
         for index, (number, title, subtitle) in enumerate(stage_data):
             stage_row = QFrame()
@@ -922,7 +889,7 @@ class PageProcessing(QWidget):
                 "badge": "background:#151D29; border:1px solid #2A3546; border-radius:11px; color:#687990; font-size:12px; font-weight:700;",
                 "title": "background:transparent; border:none; color:#8795A9; font-size:12px; font-weight:650;",
                 "subtitle": "background:transparent; border:none; color:#66768C; font-size:10px;",
-                "text": "LLM пока не подключена",
+                "text": "JSON для LLM подготовлен",
             },
             "error": {
                 "badge": "background:#3C2027; border:1px solid #D85B68; border-radius:11px; color:#FFC0C6; font-size:12px; font-weight:800;",
@@ -950,12 +917,10 @@ class PageProcessing(QWidget):
 
     def set_active_stage(self, index):
         """Mark earlier pipeline steps done and highlight the active one."""
-        self._stage_index = max(0, min(int(index), 2))
+        self._stage_index = max(0, min(int(index), 3))
         states = []
         for i in range(4):
-            if i == 3:
-                states.append("planned")
-            elif i < self._stage_index:
+            if i < self._stage_index:
                 states.append("done")
             elif i == self._stage_index:
                 states.append("active")
@@ -964,16 +929,14 @@ class PageProcessing(QWidget):
         self._render_stage_states(states)
 
     def complete_stages(self):
-        self._stage_index = 2
-        self._render_stage_states(["done", "done", "done", "planned"])
+        self._stage_index = 3
+        self._render_stage_states(["done", "done", "done", "done"])
 
     def fail_stage(self):
         states = []
-        current = max(0, min(self._stage_index, 2))
+        current = max(0, min(self._stage_index, 3))
         for i in range(4):
-            if i == 3:
-                states.append("planned")
-            elif i < current:
+            if i < current:
                 states.append("done")
             elif i == current:
                 states.append("error")
@@ -1167,12 +1130,13 @@ class PageResult(QWidget):
         card.value_label = value_label
         return card
 
-    def update_results(self, records, last_frame, video_path, model, conf):
+    def update_results(self, records, last_frame, video_path, model, conf, analysis_data=None):
         signature = (video_path, len(records), records[-1].get("frame_index") if records else None)
         if signature == self._last_results_signature and self.cap and self.cap.isOpened():
             return
         self._last_results_signature = signature
         self.records = list(records)
+        self.analysis_data = analysis_data or {}
         self.btn_clean_video.blockSignals(True)
         self.btn_clean_video.setChecked(False)
         self.btn_clean_video.setText("○  Видео без рамок")
@@ -1217,6 +1181,25 @@ class PageResult(QWidget):
     def _populate_summary(self):
         self.desc_text.clear()
         rows = []
+        scene = self.analysis_data.get("scene", {})
+        if scene.get("text"):
+            rows.append("<h3 style='color:#8BB9FF;'>Общая сводка сцены</h3>")
+            rows.append(f"<p style='color:#DCE5F2;'>{scene['text']}</p>")
+        timeline = self.analysis_data.get("timeline", [])
+        if timeline:
+            rows.append("<h3 style='color:#8BB9FF;'>События на видео</h3>")
+            for event in timeline:
+                t = float(event.get("t", 0))
+                frame_idx = int(t * self.fps)
+                timecode = event.get("timecode", f"{t:.1f} с")
+                desc = event.get("description", event.get("type", "Событие"))
+                rows.append(
+                    f"<div style='padding:9px 4px;border-bottom:1px solid #243044;'>"
+                    f"<a href='{frame_idx}' style='color:#80B2FF;text-decoration:none;font-weight:700;'>{timecode}</a>"
+                    f"<br><span style='color:#DCE5F2;'>{desc}</span></div>"
+                )
+            self.desc_text.setHtml("".join(rows))
+            return
         for rec in self.records:
             timestamp = float(rec.get("time_sec", 0))
             frame_idx = int(rec.get("frame_index", 0))
@@ -1438,7 +1421,7 @@ class PageResult(QWidget):
 # ---------------------------------------------------------------------------
 
 class PageSettings(QWidget):
-    apply_requested = pyqtSignal(str, float)
+    apply_requested = pyqtSignal(str, float, str, str)
 
     def __init__(self):
         super().__init__()
@@ -1459,16 +1442,24 @@ class PageSettings(QWidget):
         model_header.addWidget(self.model_status)
         model_layout.addLayout(model_header)
         model_layout.addWidget(label(
-            "Укажите веса YOLO. Для текущего прототипа используется одна модель детекции.", "subtitle"
+            "Основная YOLO обнаруживает объекты. При необходимости можно подключить отдельные веса ДТП и дорожных знаков.", "subtitle"
         ))
         weights_row = QHBoxLayout()
-        self.weights_edit = QLineEdit("yolov8n.pt")
+        default_weights = str(Path(__file__).resolve().with_name("road_all.pt")) if Path(__file__).resolve().with_name("road_all.pt").is_file() else "yolov8n.pt"
+        self.weights_edit = QLineEdit(default_weights)
         self.weights_edit.setPlaceholderText("Путь к файлу весов .pt")
         self.btn_weights = QPushButton("Обзор…")
         self.btn_weights.clicked.connect(self._browse_weights)
         weights_row.addWidget(self.weights_edit, 1)
         weights_row.addWidget(self.btn_weights)
         model_layout.addLayout(weights_row)
+        model_layout.addWidget(label("Дополнительные модели (необязательно)", "sectionTitle"))
+        self.accident_weights_edit = QLineEdit()
+        self.accident_weights_edit.setPlaceholderText("Путь к весам модели ДТП (.pt)")
+        self.road_weights_edit = QLineEdit()
+        self.road_weights_edit.setPlaceholderText("Путь к весам дорожных знаков и переходов (.pt)")
+        model_layout.addWidget(self.accident_weights_edit)
+        model_layout.addWidget(self.road_weights_edit)
         root.addWidget(model_card)
 
         params_card = panel()
@@ -1511,7 +1502,7 @@ class PageSettings(QWidget):
         future_text = QVBoxLayout()
         future_text.addWidget(label("Генерация текстового описания", "sectionTitle"))
         future_text.addWidget(label(
-            "Qwen2.5 и выбор языка описания будут подключены на следующем этапе. Сейчас эти параметры не влияют на анализ.",
+            "На этом этапе формируется result_llm.json для последующей передачи в Qwen2.5. Сам вызов языковой модели пока не подключён.",
             "subtitle",
         ))
         future_layout.addLayout(future_text, 1)
@@ -1542,12 +1533,17 @@ class PageSettings(QWidget):
             if not Path(weights).is_file():
                 QMessageBox.warning(self, "Модель не найдена", "Проверьте путь к файлу весов.")
                 return
-        self.apply_requested.emit(weights, float(self.conf_combo.currentData()))
+        self.apply_requested.emit(
+            weights, float(self.conf_combo.currentData()),
+            self.accident_weights_edit.text().strip(), self.road_weights_edit.text().strip(),
+        )
 
     def set_loading(self, loading: bool):
         self.btn_apply.setEnabled(not loading)
         self.btn_weights.setEnabled(not loading)
         self.weights_edit.setEnabled(not loading)
+        self.accident_weights_edit.setEnabled(not loading)
+        self.road_weights_edit.setEnabled(not loading)
         self.model_status.setText("ЗАГРУЗКА…" if loading else "НАСТРОЙКА")
 
 
@@ -1570,7 +1566,13 @@ class MainWindow(QMainWindow):
         self.all_records = []
         self.current_video_path = ""
         self.current_conf = 0.4
-        self.model_weights = "yolov8n.pt"
+        self.analysis_data = {}
+        unified_weights = Path(__file__).resolve().with_name("road_all.pt")
+        self.model_weights = str(unified_weights) if unified_weights.is_file() else "yolov8n.pt"
+        self.accident_weights = ""
+        self.road_weights = ""
+        self.loaded_accident_weights = ""
+        self.loaded_road_weights = ""
         self._analysis_error = ""
 
         root = QWidget()
@@ -1682,7 +1684,7 @@ class MainWindow(QMainWindow):
                 return
             self.page_res.update_results(
                 self.all_records, self.last_frame, self.current_video_path,
-                self.model, self.current_conf,
+                self.model, self.current_conf, self.analysis_data,
             )
             self.stack.setCurrentWidget(self.page_res)
             self._set_nav(1)
@@ -1694,7 +1696,7 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.page_set)
             self._set_nav(2)
 
-    def _load_model(self, weights, initial=False):
+    def _load_model(self, weights, initial=False, accident_weights=None, road_weights=None):
         if self.video_thread and self.video_thread.isRunning():
             QMessageBox.warning(self, "Обработка выполняется", "Остановите анализ перед заменой модели.")
             return
@@ -1706,7 +1708,9 @@ class MainWindow(QMainWindow):
         self.model_state_pill.style().unpolish(self.model_state_pill)
         self.model_state_pill.style().polish(self.model_state_pill)
         self.statusBar().showMessage(f"Загрузка модели: {weights}")
-        self.model_thread = ModelLoadThread(weights, self)
+        accident_weights = accident_weights if accident_weights is not None else self.page_set.accident_weights_edit.text()
+        road_weights = road_weights if road_weights is not None else self.page_set.road_weights_edit.text()
+        self.model_thread = ModelLoadThread(weights, self, accident_weights, road_weights)
         self.model_thread.loaded.connect(self._on_model_loaded)
         self.model_thread.failed.connect(self._on_model_failed)
         self.model_thread.start()
@@ -1715,6 +1719,11 @@ class MainWindow(QMainWindow):
     def _on_model_loaded(self, model, weights):
         self.model = model
         self.model_weights = weights
+        if self.model_thread:
+            self.loaded_accident_weights = self.model_thread.accident_weights or ""
+            self.loaded_road_weights = self.model_thread.road_weights or ""
+        self.accident_weights = self.loaded_accident_weights
+        self.road_weights = self.loaded_road_weights
         self.page_new.btn_start.setEnabled(bool(self.page_new.file_path))
         self.page_set.set_loading(False)
         self.page_set.model_status.setText("ЗАГРУЖЕНА")
@@ -1748,14 +1757,18 @@ class MainWindow(QMainWindow):
             "Проверьте имя модели или укажите доступный файл .pt в настройках.",
         )
 
-    def _apply_model_settings(self, weights, confidence):
+    def _apply_model_settings(self, weights, confidence, accident_weights="", road_weights=""):
         self.current_conf = float(confidence)
-        if self.model is not None and weights == self.model_weights:
+        self.accident_weights = accident_weights.strip()
+        self.road_weights = road_weights.strip()
+        if (self.model is not None and weights == self.model_weights
+                and self.accident_weights == self.loaded_accident_weights
+                and self.road_weights == self.loaded_road_weights):
             self.statusBar().showMessage(
                 f"Порог уверенности применён: {self.current_conf:.2f}".replace(".", ","), 4000
             )
             return
-        self._load_model(weights)
+        self._load_model(weights, accident_weights=self.accident_weights, road_weights=self.road_weights)
 
     def _start_processing(self, config):
         if self.model is None:
@@ -1765,6 +1778,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Обработка", "Анализ уже выполняется.")
             return
         self.all_records.clear()
+        self.analysis_data = {}
         self.last_frame = None
         self.current_video_path = config["source"]
         self._analysis_error = ""
@@ -1774,7 +1788,11 @@ class MainWindow(QMainWindow):
         self._set_nav(0)
         self.video_thread = VideoThread(
             config["source_type"], config["source"], self.model,
-            conf=self.current_conf, step=config["step"], parent=self,
+            conf=self.current_conf, step=config["step"],
+            weights=self.model_weights,
+            accident_weights=self.loaded_accident_weights,
+            road_weights=self.loaded_road_weights,
+            parent=self,
         )
         self.video_thread.frame_ready.connect(self._on_frame)
         self.video_thread.record_ready.connect(self._on_record)
@@ -1797,6 +1815,12 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self):
         self.page_proc.btn_stop.setEnabled(False)
+        if self.video_thread:
+            self.analysis_data = self.video_thread.analysis_data or {}
+            if self.video_thread.result_json:
+                self.statusBar().showMessage(
+                    f"Сохранены {Path(self.video_thread.result_json).name} и {Path(self.video_thread.llm_json).name}", 7000
+                )
         if self.all_records:
             if self._analysis_error:
                 self.page_proc.fail_stage()
