@@ -18,15 +18,18 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtCore import (
+    QEvent, Qt, QThread, pyqtSignal, pyqtProperty, QUrl, QTimer, QSettings,
+    QRectF, QPointF, QSize, QPropertyAnimation, QEasingCurve,
+)
+from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor, QPen, QPainterPath
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QLineEdit, QComboBox,
     QDoubleSpinBox, QTextEdit, QMessageBox, QFormLayout,
     QListWidget, QListWidgetItem, QStackedWidget, QFrame,
     QProgressBar, QSlider, QTextBrowser, QProgressDialog,
-    QSpinBox, QSizePolicy, QSpacerItem,
+    QSpinBox, QSizePolicy, QSpacerItem, QDialog, QScrollArea, QAbstractButton,
 )
 
 import main as pipeline
@@ -35,6 +38,235 @@ from main import (
     open_video, open_camera, open_rtsp, video_info, live_info,
     LatestFrameReader, iter_frames, save_result,
 )
+
+
+class SwitchControl(QAbstractButton):
+    """Переключатель с подписью и анимированным ползунком.
+
+    Подпись показывает ТЕКУЩЕЕ состояние (unchecked_text / checked_text).
+    Нажимается только сам трек справа (подпись не кликабельна), если не
+    передан label_clickable=True. Поддерживает клавиатуру (Space / Enter),
+    светлую и тёмную темы и необязательную иконку на ползунке:
+    icon="theme" рисует солнце / луну.
+    """
+
+    TRACK_W, TRACK_H = 44, 25
+    KNOB_D, KNOB_PAD = 19, 3
+    RIGHT_MARGIN = 2
+    TEXT_GAP = 10
+
+    # Испускается, когда ползунок доехал до конца (с итоговым состоянием).
+    # Нужен для тяжёлых действий вроде смены темы: их запускают уже ПОСЛЕ
+    # анимации, иначе перестройка стилей «съедает» кадры и ползунок дёргается.
+    settled = pyqtSignal(bool)
+
+    def __init__(self, unchecked_text, checked_text, icon=None,
+                 label_clickable=False, parent=None):
+        super().__init__(parent)
+        self.unchecked_text = unchecked_text
+        self.checked_text = checked_text
+        self.icon_kind = icon
+        self.label_clickable = bool(label_clickable)
+        self.theme = "light"
+        self._offset = 0.0          # 0.0 — выключен, 1.0 — включён
+        self._hover = False
+        self._focus_ring = False
+
+        self.setCheckable(True)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(Qt.ArrowCursor)
+        self.setMinimumSize(150, 42)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        self._anim = QPropertyAnimation(self, b"offset", self)
+        self._anim.setDuration(170)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.toggled.connect(lambda _checked: self._sync_knob(animated=True))
+        self._anim.finished.connect(lambda: self.settled.emit(self.isChecked()))
+
+    # -- анимируемое свойство ------------------------------------------------
+    def _get_offset(self):
+        return self._offset
+
+    def _set_offset(self, value):
+        self._offset = float(value)
+        self.update()
+
+    offset = pyqtProperty(float, fget=_get_offset, fset=_set_offset)
+
+    def _sync_knob(self, animated):
+        target = 1.0 if self.isChecked() else 0.0
+        self._anim.stop()
+        if animated and self.isVisible():
+            self._anim.setStartValue(self._offset)
+            self._anim.setEndValue(target)
+            self._anim.start()
+        else:
+            self._set_offset(target)
+
+    def setChecked(self, checked):
+        # Программная установка (в т.ч. при заблокированных сигналах) не
+        # вызывает toggled, поэтому синхронизируем ползунок вручную.
+        super().setChecked(checked)
+        self._sync_knob(animated=not self.signalsBlocked())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_knob(animated=False)
+
+    # -- тема и геометрия -------------------------------------------------------
+    def set_theme(self, theme):
+        self.theme = theme if theme in ("light", "dark") else "light"
+        self.update()
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        text_w = max(fm.horizontalAdvance(self.unchecked_text),
+                     fm.horizontalAdvance(self.checked_text))
+        width = text_w + self.TEXT_GAP + self.TRACK_W + self.RIGHT_MARGIN + 4
+        return QSize(max(164, width), 42)
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+    def _track_rect(self):
+        return QRectF(
+            self.width() - self.TRACK_W - self.RIGHT_MARGIN,
+            (self.height() - self.TRACK_H) / 2.0,
+            self.TRACK_W, self.TRACK_H,
+        )
+
+    def hitButton(self, pos):
+        """Qt сам вызывает это при нажатии/отпускании мыши: клик засчитывается
+        только по треку (с небольшим запасом), а не по подписи."""
+        if self.label_clickable:
+            return self.rect().contains(pos)
+        return self._track_rect().adjusted(-4, -6, 4, 6).contains(QPointF(pos))
+
+    # -- события ------------------------------------------------------------------
+    def mouseMoveEvent(self, event):
+        over = self.isEnabled() and self.hitButton(event.pos())
+        self.setCursor(Qt.PointingHandCursor if over else Qt.ArrowCursor)
+        if over != self._hover:
+            self._hover = over
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event):
+        # Space обрабатывает сам QAbstractButton; добавляем Enter / Return.
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not event.isAutoRepeat():
+            self.click()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusInEvent(self, event):
+        self._focus_ring = event.reason() in (
+            Qt.TabFocusReason, Qt.BacktabFocusReason, Qt.ShortcutFocusReason)
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event):
+        self._focus_ring = False
+        super().focusOutEvent(event)
+        self.update()
+
+    # -- отрисовка ----------------------------------------------------------------
+    @staticmethod
+    def _mix(c1, c2, t):
+        return QColor(
+            int(c1.red() + (c2.red() - c1.red()) * t),
+            int(c1.green() + (c2.green() - c1.green()) * t),
+            int(c1.blue() + (c2.blue() - c1.blue()) * t),
+        )
+
+    def _draw_icon(self, painter, center, dark_icon):
+        if self.icon_kind != "theme":
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        if dark_icon:   # луна
+            moon = QPainterPath()
+            moon.addEllipse(center, 5.2, 5.2)
+            cut = QPainterPath()
+            cut.addEllipse(QPointF(center.x() + 2.8, center.y() - 2.0), 4.4, 4.4)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#3B4A66"))
+            painter.drawPath(moon.subtracted(cut))
+        else:           # солнце
+            amber = QColor("#F2A93B")
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(amber)
+            painter.drawEllipse(center, 3.2, 3.2)
+            pen = QPen(amber, 1.3)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            for i in range(8):
+                angle = i * math.pi / 4
+                dx, dy = math.cos(angle), math.sin(angle)
+                painter.drawLine(
+                    QPointF(center.x() + dx * 5.0, center.y() + dy * 5.0),
+                    QPointF(center.x() + dx * 6.8, center.y() + dy * 6.8),
+                )
+        painter.restore()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        enabled = self.isEnabled()
+        dark = self.theme == "dark"
+        t = self._offset
+
+        # Подпись: показывает текущее состояние.
+        text = self.checked_text if self.isChecked() else self.unchecked_text
+        fg = QColor(("#E7ECF5" if dark else "#20384E") if enabled else "#8A98A8")
+        painter.setPen(fg)
+        painter.setFont(self.font())
+        text_rect = self.rect().adjusted(
+            0, 0, -(self.TRACK_W + self.RIGHT_MARGIN + self.TEXT_GAP), 0)
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
+
+        # Трек: цвет плавно перетекает между «выкл» и «вкл».
+        off_color = QColor("#3A4A60" if dark else "#B9C7D5")
+        on_color = QColor("#3478F6" if dark else "#1769AA")
+        if self._hover and enabled:
+            off_color = off_color.lighter(108)
+            on_color = on_color.lighter(108)
+        track_color = self._mix(off_color, on_color, t)
+        if not enabled:
+            track_color.setAlpha(110)
+        track = self._track_rect()
+        radius = track.height() / 2.0
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(track_color)
+        painter.drawRoundedRect(track, radius, radius)
+
+        if self._focus_ring and enabled:
+            ring = QColor(on_color)
+            ring.setAlpha(150)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(ring, 2))
+            painter.drawRoundedRect(track.adjusted(-3, -3, 3, 3), radius + 3, radius + 3)
+            painter.setPen(Qt.NoPen)
+
+        # Ползунок.
+        d = float(self.KNOB_D)
+        knob_x = track.x() + self.KNOB_PAD + (track.width() - d - 2 * self.KNOB_PAD) * t
+        knob_y = track.y() + (track.height() - d) / 2.0
+        painter.setBrush(QColor(0, 0, 0, 38))               # мягкая тень
+        painter.drawEllipse(QRectF(knob_x, knob_y + 1.0, d, d))
+        painter.setBrush(QColor("#FFFFFF" if enabled else "#F1F4F8"))
+        painter.drawEllipse(QRectF(knob_x, knob_y, d, d))
+        self._draw_icon(painter, QPointF(knob_x + d / 2.0, knob_y + d / 2.0), self.isChecked())
+        painter.end()
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +388,8 @@ QPushButton#cleanVideoBtn:checked {
 }
 QPushButton#cleanVideoBtn:checked:hover { background: #123B36; border-color: #23B49A; }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+    min-height: 24px;
+    padding: 8px 10px;
     background: #0B121D; border: 1px solid #2A374A; border-radius: 7px;
     padding: 9px 10px; color: #E8EEF7; selection-background-color: #3478F6;
 }
@@ -197,6 +431,41 @@ QStatusBar::item { border: none; }
 QToolTip { background: #192536; color: #F0F4FA; border: 1px solid #3A4D68; padding: 5px; }
 """
 
+# Светлая палитра в духе интерфейсов ELTEX EVI. Видео-превью остаётся тёмным,
+# чтобы изображение с камеры не теряло контраст.
+LIGHT_APP_STYLE = APP_STYLE
+_LIGHT_COLORS = {
+    "#E7ECF5": "#202A38", "#0B1018": "#F3F6FA", "#0E1420": "#FFFFFF",
+    "#222D3D": "#DCE3EC", "#3478F6": "#1769AA", "#F4F7FC": "#172B3F",
+    "#70809A": "#718096", "#6F85A7": "#61758C", "#91A0B5": "#617184",
+    "#8291A8": "#64758A", "#78869B": "#718096", "#EDF2FA": "#26384B",
+    "#F5F8FD": "#172B3F", "#8493A9": "#718096", "#172B47": "#E7F1FA",
+    "#90BCFF": "#1769AA", "#234675": "#C5D9EA", "#132D2B": "#E5F4EF",
+    "#67D9C3": "#16785F", "#205047": "#BFE4D8", "#302718": "#FFF4DE",
+    "#E9BC71": "#95620B", "#604A27": "#EBD8AE", "#111925": "#FFFFFF",
+    "#253144": "#DCE3EC", "#0F1723": "#F8FAFC", "#0F1929": "#F5F9FC",
+    "#365276": "#9CB8D0", "#14233A": "#EAF3FA", "#4E91FF": "#1769AA",
+    "#1A2433": "#F1F5F9", "#2B394D": "#CFD8E3", "#D9E2F0": "#26384B",
+    "#243247": "#E5EDF5", "#405675": "#AFC1D2", "#172131": "#E1E8F0",
+    "#151B25": "#E9EEF4", "#586579": "#98A5B5", "#222B39": "#D5DEE8",
+    "#4688FF": "#0F5E9C", "#2C67D7": "#124F80", "#93A0B4": "#53677D",
+    "#151F2D": "#EAF1F7", "#E8EEF8": "#1D344A", "#182A43": "#E3F0FA",
+    "#8BB9FF": "#1769AA", "#25446E": "#C4DCEC", "#2A1A20": "#FCEBEC",
+    "#F4A4A8": "#A33D48", "#553039": "#E9C4C8", "#3A2029": "#F7DDE0",
+    "#121D2B": "#F7F9FC", "#B9C7D9": "#40566D", "#19283A": "#E9F1F8",
+    "#47617E": "#AFC4D7", "#0E2C2A": "#E3F5EF", "#6EE7C8": "#16785F",
+    "#168A77": "#A9DCCD", "#123B36": "#D4EEE5", "#23B49A": "#168A77",
+    "#0B121D": "#FFFFFF", "#2A374A": "#CBD5E1", "#E8EEF7": "#26384B",
+    "#4789F8": "#1769AA", "#65758D": "#8998A9", "#234776": "#D7EAF8",
+    "#263347": "#D5DEE8", "#DDE6F3": "#26384B", "#254B7D": "#C9E0F2",
+    "#162235": "#EAF1F7", "#1A3150": "#DCECF8", "#EAF2FF": "#1D344A",
+    "#202B3B": "#E2E8F0", "#29364A": "#D2DCE7", "#E8F0FF": "#FFFFFF",
+    "#33435A": "#B8C5D3", "#8796AC": "#64758A", "#192536": "#FFFFFF",
+    "#F0F4FA": "#26384B", "#3A4D68": "#C7D2DE"
+}
+for _dark, _light in _LIGHT_COLORS.items():
+    LIGHT_APP_STYLE = LIGHT_APP_STYLE.replace(_dark, _light)
+
 
 def panel(object_name: str = "card") -> QFrame:
     frame = QFrame()
@@ -206,8 +475,12 @@ def panel(object_name: str = "card") -> QFrame:
 
 def label(text: str, object_name: str | None = None, parent=None) -> QLabel:
     widget = QLabel(text, parent)
+    widget.setTextFormat(Qt.PlainText)
     if object_name:
         widget.setObjectName(object_name)
+    if object_name in ("subtitle", "smallMuted"):
+        widget.setWordWrap(True)
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
     return widget
 
 
@@ -217,8 +490,15 @@ def page_heading(kicker: str, title: str, subtitle: str) -> QWidget:
     layout.setContentsMargins(0, 0, 0, 5)
     layout.setSpacing(7)
     layout.addWidget(label(kicker.upper(), "eyebrow"))
-    layout.addWidget(label(title, "title"))
-    layout.addWidget(label(subtitle, "subtitle"))
+    title_label = label(title, "title")
+    title_label.setTextFormat(Qt.PlainText)
+    title_label.setFont(QFont("Arial", 27, QFont.Bold))
+    title_label.setMinimumHeight(40)
+    title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    layout.addWidget(title_label)
+    subtitle_label = label(subtitle, "subtitle")
+    subtitle_label.setWordWrap(True)
+    layout.addWidget(subtitle_label)
     return block
 
 
@@ -501,11 +781,11 @@ class PageNewAnalysis(QWidget):
 
         self.drop_zone = panel("dropZone")
         self.drop_zone.setProperty("active", False)
-        self.drop_zone.setMinimumHeight(310)
+        self.drop_zone.setMinimumHeight(280)
         self.drop_zone.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         drop_layout = QVBoxLayout(self.drop_zone)
-        drop_layout.setContentsMargins(25, 28, 25, 28)
-        drop_layout.setSpacing(13)
+        drop_layout.setContentsMargins(28, 28, 28, 28)
+        drop_layout.setSpacing(12)
         drop_layout.setAlignment(Qt.AlignCenter)
 
         self.upload_mark = QLabel("↑")
@@ -516,10 +796,25 @@ class PageNewAnalysis(QWidget):
             "color:#82B5FF; font-size:28px; font-weight:600;"
         )
         drop_layout.addWidget(self.upload_mark, alignment=Qt.AlignCenter)
-        drop_layout.addWidget(label("Перетащите видео сюда", "sectionTitle"), alignment=Qt.AlignCenter)
+
+        upload_title = label("Перетащите видео сюда", "sectionTitle")
+        upload_title.setAlignment(Qt.AlignCenter)
+        upload_title.setWordWrap(False)
+        upload_title.setFixedHeight(26)
+        drop_layout.addWidget(upload_title, alignment=Qt.AlignCenter)
+
         desc = label("или выберите файл на компьютере", "subtitle")
+        desc.setAlignment(Qt.AlignCenter)
+        desc.setWordWrap(False)
+        desc.setFixedHeight(28)
+        desc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         drop_layout.addWidget(desc, alignment=Qt.AlignCenter)
+
         formats = label("MP4  ·  AVI  ·  MOV  ·  MKV", "smallMuted")
+        formats.setAlignment(Qt.AlignCenter)
+        formats.setWordWrap(False)
+        formats.setFixedHeight(22)
+        formats.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         drop_layout.addWidget(formats, alignment=Qt.AlignCenter)
         self.btn_browse = QPushButton("Выбрать видеофайл")
         self.btn_browse.setObjectName("primaryBtn")
@@ -568,6 +863,8 @@ class PageNewAnalysis(QWidget):
         # Compact processing-settings card: keep the content grouped at the top
         # instead of letting the widgets spread out across the full column.
         params_card = panel()
+        params_card.setMinimumWidth(0)
+        params_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         params_card.setMinimumHeight(205)
         params_card.setMaximumHeight(235)
         params_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
@@ -623,6 +920,27 @@ class PageNewAnalysis(QWidget):
         self.btn_start.clicked.connect(self._on_start)
         bottom.addWidget(self.btn_start)
         root.addLayout(bottom)
+
+    def set_theme(self, theme):
+        light = theme == "light"
+        if light:
+            self.upload_mark.setStyleSheet(
+                "background:#E7F1FA; border:1px solid #BFD5E8; border-radius:16px; "
+                "color:#006FB3; font-size:28px; font-weight:600;"
+            )
+            self.file_icon.setStyleSheet(
+                "background:#EAF2F8; border:1px solid #CBD9E6; border-radius:10px; "
+                "color:#24506F; font-size:12px; font-weight:800;"
+            )
+        else:
+            self.upload_mark.setStyleSheet(
+                "background:#172A43; border:1px solid #294B76; border-radius:16px; "
+                "color:#82B5FF; font-size:28px; font-weight:600;"
+            )
+            self.file_icon.setStyleSheet(
+                "background:#19263A; border:1px solid #2B405E; border-radius:10px; "
+                "color:#A6C8FF; font-size:12px; font-weight:800;"
+            )
 
     def _update_step_hint(self, index=None):
         """Show a short, useful explanation for the selected sampling interval."""
@@ -726,9 +1044,11 @@ class PageProcessing(QWidget):
 
     def __init__(self):
         super().__init__()
+        # Фиксированная рабочая область без прокрутки страницы.
+        # Высота распределяется между прогрессом, предпросмотром, этапами и журналом.
         root = QVBoxLayout(self)
-        root.setContentsMargins(34, 30, 34, 26)
-        root.setSpacing(20)
+        root.setContentsMargins(26, 18, 26, 14)
+        root.setSpacing(12)
         heading_row = QHBoxLayout()
         heading_row.addWidget(page_heading(
             "Рабочая область / 02", "Анализ видео",
@@ -740,7 +1060,7 @@ class PageProcessing(QWidget):
         root.addLayout(heading_row)
 
         progress_card = panel()
-        progress_layout = set_card_layout(progress_card, margins=(20, 16, 20, 17), spacing=10)
+        progress_layout = set_card_layout(progress_card, margins=(16, 11, 16, 11), spacing=7)
         top = QHBoxLayout()
         top.addWidget(label("Ход обработки", "sectionTitle"))
         top.addStretch()
@@ -757,7 +1077,7 @@ class PageProcessing(QWidget):
         root.addWidget(progress_card)
 
         body = QHBoxLayout()
-        body.setSpacing(18)
+        body.setSpacing(14)
         video_card = panel()
         video_layout = set_card_layout(video_card)
         video_header = QHBoxLayout()
@@ -767,7 +1087,7 @@ class PageProcessing(QWidget):
         video_layout.addLayout(video_header)
         self.video_label = QLabel("Ожидание первого кадра")
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(460, 330)
+        self.video_label.setMinimumSize(260, 180)
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_label.setStyleSheet(
             "background:#070B11; border:1px solid #1C2737; border-radius:8px; color:#627188;"
@@ -780,10 +1100,12 @@ class PageProcessing(QWidget):
         body.addWidget(video_card, 7)
 
         right_col = QVBoxLayout()
-        right_col.setSpacing(18)
+        right_col.setSpacing(12)
         stages_card = panel()
-        stages_card.setMinimumHeight(218)
-        stages_layout = set_card_layout(stages_card, margins=(15, 13, 15, 12), spacing=5)
+        stages_card.setMinimumWidth(0)
+        stages_card.setFixedHeight(304)
+        stages_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        stages_layout = set_card_layout(stages_card, margins=(16, 12, 16, 10), spacing=3)
         stages_layout.addWidget(label("Этапы обработки", "sectionTitle"))
         self.stage_labels = []
         stage_data = [
@@ -799,28 +1121,32 @@ class PageProcessing(QWidget):
             # задаётся по его номеру и тексту ниже.
             stage_row.setStyleSheet(
                 "QFrame#stageRow { background:transparent; border:none; "
-                + ("border-bottom:1px solid #253144;" if index < len(stage_data) - 1 else "")
+                + ("border-bottom:1px solid #D6E0EA;" if index < len(stage_data) - 1 else "")
                 + "}"
             )
             row_layout = QHBoxLayout(stage_row)
-            row_layout.setContentsMargins(0, 2, 0, 4 if index < len(stage_data) - 1 else 2)
-            row_layout.setSpacing(10)
-            stage_row.setMinimumHeight(38)
+            row_layout.setContentsMargins(0, 3, 0, 3)
+            row_layout.setSpacing(14)
+            stage_row.setFixedHeight(56)
+            stage_row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             number_label = QLabel(number)
             number_label.setAlignment(Qt.AlignCenter)
-            number_label.setFixedSize(34, 34)
+            number_label.setFixedSize(40, 40)
             text_widget = QWidget()
             text_widget.setStyleSheet("background:transparent; border:none;")
             text_col = QVBoxLayout(text_widget)
             text_col.setContentsMargins(0, 0, 0, 0)
-            text_col.setSpacing(2)
+            text_col.setSpacing(4)
             title_label = QLabel(title)
-            title_label.setMinimumHeight(16)
-            title_label.setStyleSheet("background:transparent; border:none; color:#DCE5F2; font-size:12px; font-weight:650;")
+            title_label.setFixedHeight(18)
+            title_label.setWordWrap(False)
+            title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            title_label.setStyleSheet("background:transparent; border:none; color:#DCE5F2; font-size:13px; font-weight:700;")
             subtitle_label = QLabel(subtitle)
+            subtitle_label.setFixedHeight(16)
             subtitle_label.setWordWrap(False)
-            subtitle_label.setMinimumHeight(14)
-            subtitle_label.setStyleSheet("background:transparent; border:none; color:#8797AE; font-size:10px;")
+            subtitle_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            subtitle_label.setStyleSheet("background:transparent; border:none; color:#8797AE; font-size:11px;")
             text_col.addWidget(title_label)
             text_col.addWidget(subtitle_label)
             row_layout.addWidget(number_label, 0, Qt.AlignVCenter)
@@ -835,11 +1161,15 @@ class PageProcessing(QWidget):
                 "index": index,
             })
         self._stage_index = -1
-        self._render_stage_states(["pending", "pending", "pending", "planned"])
+        self.current_theme = "light"
+        self._last_stage_states = ["pending", "pending", "pending", "planned"]
+        self._render_stage_states(self._last_stage_states)
         right_col.addWidget(stages_card)
 
         log_card = panel()
-        log_layout = set_card_layout(log_card)
+        log_card.setMinimumHeight(0)
+        log_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        log_layout = set_card_layout(log_card, margins=(15, 13, 15, 12), spacing=8)
         log_header = QHBoxLayout()
         log_header.addWidget(label("Журнал событий", "sectionTitle"))
         log_header.addStretch()
@@ -848,10 +1178,13 @@ class PageProcessing(QWidget):
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.document().setMaximumBlockCount(250)
-        self.log_edit.setMinimumHeight(130)
+        self.log_edit.setMinimumHeight(70)
+        self.log_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.log_edit.setPlaceholderText("Сообщения обработки появятся здесь.")
         log_layout.addWidget(self.log_edit, 1)
         right_col.addWidget(log_card, 1)
+        right_col.setStretch(0, 0)
+        right_col.setStretch(1, 1)
         body.addLayout(right_col, 5)
         root.addLayout(body, 1)
 
@@ -864,37 +1197,64 @@ class PageProcessing(QWidget):
         bottom.addWidget(self.btn_stop)
         root.addLayout(bottom)
 
+    def set_theme(self, theme):
+        self.current_theme = theme
+        light = theme == "light"
+        text = "#20384E" if light else "#DCE5F2"
+        muted = "#657B92" if light else "#8797AE"
+        border = "#D6E0EA" if light else "#253144"
+        preview_bg = "#F4F7FA" if light else "#070B11"
+        preview_fg = "#52677D" if light else "#AAB6C5"
+        page_bg = "#F1F5F9" if light else "#0B1018"
+        self.setStyleSheet(f"QWidget {{ background:{page_bg}; color:{text}; }}")
+        self.video_label.setStyleSheet(
+            f"background:{preview_bg}; border:1px solid {border}; "
+            f"border-radius:8px; color:{preview_fg};"
+        )
+        self.log_edit.setStyleSheet(
+            f"background:{'#FFFFFF' if light else '#0B121D'}; "
+            f"color:{text}; border:1px solid {border}; border-radius:8px; padding:8px;"
+        )
+        for item in self.stage_labels:
+            item["row"].setStyleSheet(
+                f"QFrame#stageRow {{ background:transparent; border:none; "
+                f"border-bottom:1px solid {border}; }}"
+            )
+        self._render_stage_states(self._last_stage_states)
+
     def _render_stage_states(self, states):
         """Render pending / active / completed / planned pipeline states."""
+        self._last_stage_states = list(states)
+        light = getattr(self, "current_theme", "light") == "light"
         styles = {
             "pending": {
-                "badge": "background:#192335; border:1px solid #2A3A52; border-radius:11px; color:#8FA2BC; font-size:12px; font-weight:750;",
-                "title": "background:transparent; border:none; color:#CAD5E5; font-size:12px; font-weight:650;",
-                "subtitle": "background:transparent; border:none; color:#8494AA; font-size:10px;",
+                "badge": ("background:#EEF3F8; border:1px solid #C9D5E2; border-radius:11px; color:#52677D; font-size:12px; font-weight:750;" if light else "background:#192335; border:1px solid #2A3A52; border-radius:11px; color:#8FA2BC; font-size:12px; font-weight:750;"),
+                "title": ("background:transparent; border:none; color:#29445D; font-size:12px; font-weight:650;" if light else "background:transparent; border:none; color:#CAD5E5; font-size:12px; font-weight:650;"),
+                "subtitle": ("background:transparent; border:none; color:#657B92; font-size:10px;" if light else "background:transparent; border:none; color:#8494AA; font-size:10px;"),
                 "text": None,
             },
             "active": {
                 "badge": "background:#1B4C82; border:1px solid #65A4FF; border-radius:11px; color:#FFFFFF; font-size:12px; font-weight:800;",
-                "title": "background:transparent; border:none; color:#F3F7FF; font-size:12px; font-weight:750;",
-                "subtitle": "background:transparent; border:none; color:#91BEFF; font-size:10px; font-weight:650;",
+                "title": ("background:transparent; border:none; color:#075A91; font-size:12px; font-weight:750;" if light else "background:transparent; border:none; color:#F3F7FF; font-size:12px; font-weight:750;"),
+                "subtitle": ("background:transparent; border:none; color:#0877B9; font-size:10px; font-weight:650;" if light else "background:transparent; border:none; color:#91BEFF; font-size:10px; font-weight:650;"),
                 "text": "Выполняется…",
             },
             "done": {
-                "badge": "background:#123B32; border:1px solid #28A987; border-radius:11px; color:#82F0D0; font-size:12px; font-weight:800;",
-                "title": "background:transparent; border:none; color:#DDFBF2; font-size:12px; font-weight:700;",
-                "subtitle": "background:transparent; border:none; color:#6ECBB2; font-size:10px;",
+                "badge": ("background:#DDF5EE; border:1px solid #36A98A; border-radius:11px; color:#08765D; font-size:12px; font-weight:800;" if light else "background:#123B32; border:1px solid #28A987; border-radius:11px; color:#82F0D0; font-size:12px; font-weight:800;"),
+                "title": ("background:transparent; border:none; color:#176B58; font-size:12px; font-weight:700;" if light else "background:transparent; border:none; color:#DDFBF2; font-size:12px; font-weight:700;"),
+                "subtitle": ("background:transparent; border:none; color:#16866C; font-size:10px;" if light else "background:transparent; border:none; color:#6ECBB2; font-size:10px;"),
                 "text": "Завершено",
             },
             "planned": {
-                "badge": "background:#151D29; border:1px solid #2A3546; border-radius:11px; color:#687990; font-size:12px; font-weight:700;",
-                "title": "background:transparent; border:none; color:#8795A9; font-size:12px; font-weight:650;",
-                "subtitle": "background:transparent; border:none; color:#66768C; font-size:10px;",
+                "badge": ("background:#F0F3F7; border:1px solid #D1DAE4; border-radius:11px; color:#60758B; font-size:12px; font-weight:700;" if light else "background:#151D29; border:1px solid #2A3546; border-radius:11px; color:#687990; font-size:12px; font-weight:700;"),
+                "title": ("background:transparent; border:none; color:#526A81; font-size:12px; font-weight:650;" if light else "background:transparent; border:none; color:#8795A9; font-size:12px; font-weight:650;"),
+                "subtitle": ("background:transparent; border:none; color:#6C8095; font-size:10px;" if light else "background:transparent; border:none; color:#66768C; font-size:10px;"),
                 "text": "JSON для LLM подготовлен",
             },
             "error": {
-                "badge": "background:#3C2027; border:1px solid #D85B68; border-radius:11px; color:#FFC0C6; font-size:12px; font-weight:800;",
-                "title": "background:transparent; border:none; color:#FFDDE0; font-size:12px; font-weight:750;",
-                "subtitle": "background:transparent; border:none; color:#F29CA5; font-size:10px; font-weight:650;",
+                "badge": ("background:#FCE8E9; border:1px solid #D85B68; border-radius:11px; color:#9B2632; font-size:12px; font-weight:800;" if light else "background:#3C2027; border:1px solid #D85B68; border-radius:11px; color:#FFC0C6; font-size:12px; font-weight:800;"),
+                "title": ("background:transparent; border:none; color:#9B2632; font-size:12px; font-weight:750;" if light else "background:transparent; border:none; color:#FFDDE0; font-size:12px; font-weight:750;"),
+                "subtitle": ("background:transparent; border:none; color:#B33D49; font-size:10px; font-weight:650;" if light else "background:transparent; border:none; color:#F29CA5; font-size:10px; font-weight:650;"),
                 "text": "Ошибка этапа",
             },
         }
@@ -992,30 +1352,37 @@ class PageResult(QWidget):
         self.total_frames = 0
         self.fps = 30.0
         self.current_frame_idx = 0
+        self._current_raw_frame = None
         self.export_thread = None
         self.progress_dialog = None
         self._last_results_signature = None
         self.show_clean_video = False
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(34, 28, 34, 24)
-        root.setSpacing(16)
+        root.setContentsMargins(28, 20, 28, 18)
+        root.setSpacing(12)
         heading_row = QHBoxLayout()
         heading_row.addWidget(page_heading(
             "Рабочая область / 03", "Результаты анализа",
             "Просматривайте детекции, переходите к таймкоду и находите нужные фрагменты.",
         ))
         heading_row.addStretch()
-        self.btn_clean_video = QPushButton("○  Видео без рамок")
-        self.btn_clean_video.setObjectName("cleanVideoBtn")
-        self.btn_clean_video.setCheckable(True)
-        self.btn_clean_video.setToolTip("Переключить просмотр исходного видео без зелёных рамок")
-        self.btn_clean_video.toggled.connect(self._toggle_clean_video)
-        heading_row.addWidget(self.btn_clean_video, alignment=Qt.AlignVCenter)
-
         self.btn_export = QPushButton("Экспорт видео")
         self.btn_export.setObjectName("primaryBtn")
         self.btn_export.clicked.connect(self._export_video)
+
+        self.btn_properties = QPushButton("Свойства")
+        self.btn_properties.setToolTip("Открыть сведения об анализе в отдельном окне")
+        self.btn_properties.clicked.connect(self._show_properties)
+
+        self.btn_clean_video = SwitchControl("С рамками", "Без рамок")
+        self.btn_clean_video.setToolTip("Переключить отображение рамок детекции")
+        self.btn_clean_video.toggled.connect(self._toggle_clean_video)
+
+        # Крупные действия в заголовке: свойства слева, экспорт справа.
+        for action_button in (self.btn_export, self.btn_properties):
+            action_button.setFixedSize(164, 48)
+        heading_row.addWidget(self.btn_properties, alignment=Qt.AlignVCenter)
         heading_row.addWidget(self.btn_export, alignment=Qt.AlignVCenter)
         root.addLayout(heading_row)
 
@@ -1027,29 +1394,85 @@ class PageResult(QWidget):
         self.metric_source = self._metric_card("ИСТОЧНИК", "—", "Текущая запись")
         for metric in (self.metric_frames, self.metric_detections, self.metric_step, self.metric_source):
             metrics.addWidget(metric, 1)
-        root.addLayout(metrics)
+
+        self.properties_dialog = QDialog(self)
+        self.properties_dialog.setWindowTitle("Свойства анализа")
+        self.properties_dialog.setMinimumWidth(620)
+        self.properties_dialog.resize(760, 260)
+        properties_layout = QVBoxLayout(self.properties_dialog)
+        properties_layout.setContentsMargins(20, 20, 20, 20)
+        properties_layout.setSpacing(12)
+        properties_layout.addWidget(label("Свойства текущего анализа", "sectionTitle"))
+        properties_layout.addLayout(metrics)
+        self.properties_dialog.setModal(False)
+        self.current_theme = "light"
 
         content = QHBoxLayout()
-        content.setSpacing(16)
+        content.setSpacing(14)
         left = QVBoxLayout()
-        left.setSpacing(16)
+        left.setSpacing(10)
 
         video_card = panel()
-        video_layout = set_card_layout(video_card, margins=(16, 15, 16, 15), spacing=12)
+        video_layout = set_card_layout(video_card, margins=(14, 12, 14, 12), spacing=8)
         video_head = QHBoxLayout()
         video_head.addWidget(label("Видео", "sectionTitle"))
         video_head.addStretch()
-        self.video_state = label("ПРОСМОТР", "pillGreen")
-        video_head.addWidget(self.video_state)
+        self.btn_clean_video.setFixedSize(164, 42)
+        video_head.addWidget(self.btn_clean_video, alignment=Qt.AlignVCenter)
+        video_head.addSpacing(16)
+        self.btn_fullscreen = QPushButton("⛶")
+        self.btn_fullscreen.setFixedSize(38, 34)
+        self.btn_fullscreen.setToolTip("Открыть видео на весь экран")
+        self.btn_fullscreen.clicked.connect(self._open_fullscreen)
+        video_head.addWidget(self.btn_fullscreen)
         video_layout.addLayout(video_head)
         self.result_video = QLabel("Выберите видео и завершите анализ")
         # Give the analyzed video more room; the label expands with the result pane.
-        self.result_video.setMinimumSize(560, 320)
-        self.result_video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.result_video.setMinimumSize(320, 220)
+        self.result_video.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.result_video.setAlignment(Qt.AlignCenter)
         self.result_video.setStyleSheet(
             "background:#070B11; border:1px solid #1D2838; border-radius:8px; color:#68788F;"
         )
+        self.fullscreen_dialog = QDialog(self)
+        self.fullscreen_dialog.setWindowTitle("SceneVision — просмотр видео")
+        self.fullscreen_dialog.setMinimumSize(640, 420)
+        self.fullscreen_dialog.setStyleSheet("QDialog { background:#070B11; }")
+        fullscreen_layout = QVBoxLayout(self.fullscreen_dialog)
+        fullscreen_layout.setContentsMargins(12, 12, 12, 12)
+        fullscreen_layout.setSpacing(8)
+        fullscreen_toolbar = QHBoxLayout()
+        fullscreen_toolbar.addWidget(QLabel("Полноэкранный просмотр"))
+        fullscreen_toolbar.addStretch()
+        self.btn_exit_fullscreen = QPushButton("✕  Закрыть")
+        self.btn_exit_fullscreen.clicked.connect(self.fullscreen_dialog.close)
+        fullscreen_toolbar.addWidget(self.btn_exit_fullscreen)
+        fullscreen_layout.addLayout(fullscreen_toolbar)
+        self.fullscreen_video = QLabel("Видео появится после загрузки результата")
+        self.fullscreen_video.setAlignment(Qt.AlignCenter)
+        self.fullscreen_video.setMinimumSize(0, 0)
+        self.fullscreen_video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.fullscreen_video.setStyleSheet("background:#000000; color:#AAB6C5; border:0;")
+        fullscreen_layout.addWidget(self.fullscreen_video, 1)
+
+        fullscreen_playback = QHBoxLayout()
+        self.fullscreen_btn_play = QPushButton("▶")
+        self.fullscreen_btn_play.setFixedSize(42, 36)
+        self.fullscreen_btn_play.setToolTip("Воспроизвести / пауза")
+        self.fullscreen_btn_play.clicked.connect(self._toggle_play)
+        self.fullscreen_slider = QSlider(Qt.Horizontal)
+        self.fullscreen_slider.setRange(0, 0)
+        self.fullscreen_slider.sliderMoved.connect(self._slider_moved)
+        self.fullscreen_slider.sliderPressed.connect(self._slider_pressed)
+        self.fullscreen_slider.sliderReleased.connect(self._slider_released)
+        self.fullscreen_time_label = QLabel("00:00 / 00:00")
+        self.fullscreen_time_label.setMinimumWidth(105)
+        self.fullscreen_time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        fullscreen_playback.addWidget(self.fullscreen_btn_play)
+        fullscreen_playback.addWidget(self.fullscreen_slider, 1)
+        fullscreen_playback.addWidget(self.fullscreen_time_label)
+        fullscreen_layout.addLayout(fullscreen_playback)
+
         video_layout.addWidget(self.result_video, 1)
 
         playback = QHBoxLayout()
@@ -1069,7 +1492,7 @@ class PageResult(QWidget):
         video_layout.addLayout(playback)
         # Playback controls remain below the video viewport; no note is overlaid on the image.
         playback.setContentsMargins(0, 3, 0, 0)
-        left.addWidget(video_card, 8)
+        left.addWidget(video_card, 9)
 
         search_card = panel()
         search_layout = set_card_layout(search_card, margins=(16, 14, 16, 14), spacing=10)
@@ -1087,8 +1510,8 @@ class PageResult(QWidget):
         search_layout.addLayout(search_row)
         self.search_list = QListWidget()
         # Keep search useful while giving the video viewport priority.
-        self.search_list.setMinimumHeight(80)
-        self.search_list.setMaximumHeight(125)
+        self.search_list.setMinimumHeight(95)
+        self.search_list.setMaximumHeight(155)
         self.search_list.itemClicked.connect(self._on_search_clicked)
         search_layout.addWidget(self.search_list)
         left.addWidget(search_card, 2)
@@ -1103,6 +1526,8 @@ class PageResult(QWidget):
         title_row.addWidget(label("ЭТАП 1", "pill"))
         right_layout.addLayout(title_row)
         future_card = panel("subCard")
+        future_card.setMinimumWidth(0)
+        future_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         future_layout = QVBoxLayout(future_card)
         future_layout.setContentsMargins(13, 12, 13, 12)
         future_layout.setSpacing(5)
@@ -1117,7 +1542,7 @@ class PageResult(QWidget):
         legend = QHBoxLayout()
         legend.addWidget(label("Нажмите на таймкод, чтобы перейти к кадру.", "smallMuted"))
         right_layout.addLayout(legend)
-        content.addWidget(right_card, 4)
+        content.addWidget(right_card, 3)
         root.addLayout(content, 1)
 
     def _metric_card(self, title, value, hint):
@@ -1139,14 +1564,10 @@ class PageResult(QWidget):
         self.analysis_data = analysis_data or {}
         self.btn_clean_video.blockSignals(True)
         self.btn_clean_video.setChecked(False)
-        self.btn_clean_video.setText("○  Видео без рамок")
         self.btn_clean_video.blockSignals(False)
         self.show_clean_video = False
-        self.video_state.setText("С РАМКАМИ")
-        self.video_state.setObjectName("pill")
-        self.video_state.style().unpolish(self.video_state)
-        self.video_state.style().polish(self.video_state)
         self.video_path = video_path
+        self._current_raw_frame = None
         self.model = model
         self.conf = conf
         if self.cap is not None:
@@ -1163,6 +1584,7 @@ class PageResult(QWidget):
             raw_fps = self.cap.get(cv2.CAP_PROP_FPS)
             self.fps = raw_fps if raw_fps and math.isfinite(raw_fps) and raw_fps > 0 else 30.0
             self.slider.setRange(0, self.total_frames - 1)
+            self.fullscreen_slider.setRange(0, self.total_frames - 1)
             self._seek_and_show(0)
 
         detections = sum(sum(rec.get("summary", {}).values()) for rec in self.records)
@@ -1178,25 +1600,48 @@ class PageResult(QWidget):
         self._populate_summary()
         self._do_search()
 
+    def set_theme(self, theme: str):
+        self.current_theme = theme if theme in ("light", "dark") else "light"
+        self.btn_clean_video.set_theme(self.current_theme)
+        if self.current_theme == "light":
+            bg, fg, muted, border, link = "#FFFFFF", "#26384B", "#64758A", "#DCE3EC", "#1769AA"
+        else:
+            bg, fg, muted, border, link = "#0B121D", "#DDE6F3", "#7D8CA2", "#243044", "#80B2FF"
+        self.desc_text.setStyleSheet(
+            f"QTextBrowser {{ background:{bg}; color:{fg}; border:1px solid {border}; "
+            "border-radius:8px; padding:10px; }}"
+        )
+        self._summary_colors = (fg, muted, border, link)
+        if self.records:
+            self._populate_summary()
+
+    def _show_properties(self):
+        self.properties_dialog.show()
+        self.properties_dialog.raise_()
+        self.properties_dialog.activateWindow()
+
     def _populate_summary(self):
         self.desc_text.clear()
         rows = []
+        fg, muted, border, link_color = getattr(
+            self, "_summary_colors", ("#26384B", "#64758A", "#DCE3EC", "#1769AA")
+        )
         scene = self.analysis_data.get("scene", {})
         if scene.get("text"):
-            rows.append("<h3 style='color:#8BB9FF;'>Общая сводка сцены</h3>")
-            rows.append(f"<p style='color:#DCE5F2;'>{scene['text']}</p>")
+            rows.append(f"<h3 style='color:{link_color};'>Общая сводка сцены</h3>")
+            rows.append(f"<p style='color:{fg};'>{scene['text']}</p>")
         timeline = self.analysis_data.get("timeline", [])
         if timeline:
-            rows.append("<h3 style='color:#8BB9FF;'>События на видео</h3>")
+            rows.append(f"<h3 style='color:{link_color};'>События на видео</h3>")
             for event in timeline:
                 t = float(event.get("t", 0))
                 frame_idx = int(t * self.fps)
                 timecode = event.get("timecode", f"{t:.1f} с")
                 desc = event.get("description", event.get("type", "Событие"))
                 rows.append(
-                    f"<div style='padding:9px 4px;border-bottom:1px solid #243044;'>"
-                    f"<a href='{frame_idx}' style='color:#80B2FF;text-decoration:none;font-weight:700;'>{timecode}</a>"
-                    f"<br><span style='color:#DCE5F2;'>{desc}</span></div>"
+                    f"<div style='padding:10px 4px;border-bottom:1px solid {border};'>"
+                    f"<a href='{frame_idx}' style='color:{link_color};text-decoration:none;font-weight:700;'>{timecode}</a>"
+                    f"<br><span style='color:{fg};'>{desc}</span></div>"
                 )
             self.desc_text.setHtml("".join(rows))
             return
@@ -1205,46 +1650,73 @@ class PageResult(QWidget):
             frame_idx = int(rec.get("frame_index", 0))
             summary = rec.get("summary", {})
             link = (
-                f"<a href='{frame_idx}' style='color:#80B2FF; text-decoration:none; "
+                f"<a href='{frame_idx}' style='color:{link_color}; text-decoration:none; "
                 f"font-weight:700;'>{timestamp:.1f} с</a>"
             )
             if summary:
-                items = [
-                    f"{CLASS_RU.get(name, name)}: {count}"
-                    for name, count in summary.items()
-                ]
+                items = [f"{CLASS_RU.get(name, name)}: {count}" for name, count in summary.items()]
                 text = ", ".join(items)
                 rows.append(
-                    f"<div style='padding:9px 4px; border-bottom:1px solid #243044;'>"
-                    f"{link}<br><span style='color:#DCE5F2;'>{text}</span></div>"
+                    f"<div style='padding:10px 4px; border-bottom:1px solid {border};'>"
+                    f"{link}<br><span style='color:{fg};'>{text}</span></div>"
                 )
             else:
                 rows.append(
-                    f"<div style='padding:9px 4px; border-bottom:1px solid #243044;'>"
-                    f"{link}<br><span style='color:#7D8CA2;'>Объектов не обнаружено</span></div>"
+                    f"<div style='padding:10px 4px; border-bottom:1px solid {border};'>"
+                    f"{link}<br><span style='color:{muted};'>Объектов не обнаружено</span></div>"
                 )
         if not rows:
-            rows = ["<p style='color:#7D8CA2;'>Нет записей для отображения.</p>"]
+            rows = [f"<p style='color:{muted};'>Нет записей для отображения.</p>"]
         self.desc_text.setHtml("".join(rows))
 
     def _toggle_clean_video(self, checked: bool):
         """Toggle the preview between the source video and the annotated view."""
         self.show_clean_video = bool(checked)
-        self.btn_clean_video.setText("●  Видео без рамок" if checked else "○  Видео без рамок")
-        if checked:
-            self.video_state.setText("БЕЗ РАМОК")
-            self.video_state.setObjectName("pillGreen")
-        else:
-            self.video_state.setText("С РАМКАМИ")
-            self.video_state.setObjectName("pill")
-        self.video_state.style().unpolish(self.video_state)
-        self.video_state.style().polish(self.video_state)
-        self._seek_and_show(self.current_frame_idx)
+        self._redraw_current_frame()
 
-    def _pixmap_for_frame(self, frame, frame_idx):
-        """Render a frame with or without detection overlays according to the toggle."""
+    def _redraw_current_frame(self):
+        """Перерисовывает уже прочитанный кадр (в окне и на весь экран) без seek:
+        не сбивает воспроизведение и не читает видео заново."""
+        if self._current_raw_frame is None:
+            return
+        self.result_video.setPixmap(self._pixmap_for_frame(
+            self._current_raw_frame, self.current_frame_idx,
+            self.result_video.contentsRect().size(),
+        ))
+        self._refresh_fullscreen_frame()
+
+    def _pixmap_for_frame(self, frame, frame_idx, target_size=None):
+        """Рисует исходный кадр сразу под размер нужной области просмотра."""
         display_frame = frame if self.show_clean_video else self._draw_boxes_from_records(frame.copy(), frame_idx)
-        return frame_to_pixmap(display_frame, self.result_video.size())
+        return frame_to_pixmap(display_frame, target_size or self.result_video.size())
+
+    def _refresh_fullscreen_frame(self):
+        if self._current_raw_frame is None or not self.fullscreen_dialog.isVisible():
+            return
+        target = self.fullscreen_video.contentsRect().size()
+        if target.width() <= 0 or target.height() <= 0:
+            return
+        pixmap = self._pixmap_for_frame(
+            self._current_raw_frame, self.current_frame_idx, target
+        )
+        self.fullscreen_video.setPixmap(pixmap)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "result_video") and self._current_raw_frame is not None:
+            self.result_video.setPixmap(
+                self._pixmap_for_frame(self._current_raw_frame, self.current_frame_idx,
+                                       self.result_video.contentsRect().size())
+            )
+        if hasattr(self, "fullscreen_dialog") and self.fullscreen_dialog.isVisible():
+            QTimer.singleShot(0, self._refresh_fullscreen_frame)
+
+    def _open_fullscreen(self):
+        """Открывает текущий кадр, заново отрисованный под размер полноэкранного окна."""
+        self.fullscreen_dialog.showFullScreen()
+        self.fullscreen_dialog.raise_()
+        self.fullscreen_dialog.activateWindow()
+        QTimer.singleShot(120, self._refresh_fullscreen_frame)
 
     def _toggle_play(self):
         if not self.cap or not self.cap.isOpened():
@@ -1252,10 +1724,12 @@ class PageResult(QWidget):
         if self.is_playing:
             self.timer.stop()
             self.btn_play.setText("▶")
+            self.fullscreen_btn_play.setText("▶")
             self.is_playing = False
         else:
             self.timer.start(max(1, int(1000 / self.fps)))
             self.btn_play.setText("Ⅱ")
+            self.fullscreen_btn_play.setText("Ⅱ")
             self.is_playing = True
 
     def _next_frame(self):
@@ -1265,17 +1739,21 @@ class PageResult(QWidget):
         if not ok:
             self.timer.stop()
             self.btn_play.setText("▶")
+            self.fullscreen_btn_play.setText("▶")
             self.is_playing = False
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             self.current_frame_idx = 0
             self._seek_and_show(0)
             return
         self.current_frame_idx = max(0, int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
-        self.slider.blockSignals(True)
-        self.slider.setValue(self.current_frame_idx)
-        self.slider.blockSignals(False)
+        for timeline in (self.slider, self.fullscreen_slider):
+            timeline.blockSignals(True)
+            timeline.setValue(self.current_frame_idx)
+            timeline.blockSignals(False)
         self._update_time_label()
+        self._current_raw_frame = frame.copy()
         self.result_video.setPixmap(self._pixmap_for_frame(frame, self.current_frame_idx))
+        self._refresh_fullscreen_frame()
 
     def _slider_pressed(self):
         self._was_playing = self.is_playing
@@ -1292,9 +1770,9 @@ class PageResult(QWidget):
     def _update_time_label(self):
         current = int(self.current_frame_idx / self.fps) if self.fps > 0 else 0
         total = int(self.total_frames / self.fps) if self.fps > 0 else 0
-        self.lbl_time.setText(
-            f"{current // 60:02d}:{current % 60:02d} / {total // 60:02d}:{total % 60:02d}"
-        )
+        value = f"{current // 60:02d}:{current % 60:02d} / {total // 60:02d}:{total % 60:02d}"
+        self.lbl_time.setText(value)
+        self.fullscreen_time_label.setText(value)
 
     def _draw_boxes_from_records(self, frame, frame_idx):
         relevant = None
@@ -1307,27 +1785,104 @@ class PageResult(QWidget):
             return draw_objects_ru(frame, relevant["objects"])
         return frame
 
+    @staticmethod
+    def _normalize_search_text(value):
+        """Нормализует текст для поиска: регистр, ё/е и лишние пробелы."""
+        return " ".join(str(value or "").lower().replace("ё", "е").split())
+
+    @classmethod
+    def _search_terms(cls, query):
+        """Возвращает варианты запроса, учитывая русские и английские названия."""
+        query = cls._normalize_search_text(query)
+        aliases = {
+            "машина": ("машина", "автомобиль", "легковой автомобиль", "car"),
+            "машины": ("машина", "автомобиль", "легковой автомобиль", "car"),
+            "авто": ("авто", "автомобиль", "машина", "car"),
+            "автомобиль": ("автомобиль", "машина", "car"),
+            "автомобили": ("автомобиль", "машина", "car"),
+            "человек": ("человек", "люди", "person"),
+            "люди": ("человек", "люди", "person"),
+            "мотоцикл": ("мотоцикл", "motorcycle"),
+            "грузовик": ("грузовик", "truck"),
+            "автобус": ("автобус", "bus"),
+            "светофор": ("светофор", "traffic light"),
+            "велосипед": ("велосипед", "велосипедист", "bicycle", "cyclist"),
+            "дтп": ("дтп", "авария", "столкновение", "accident"),
+            "авария": ("авария", "дтп", "столкновение", "accident"),
+        }
+        return aliases.get(query, (query,))
+
     def _do_search(self, *_args):
-        query = self.search_input.text().strip().lower()
+        """Ищет по тем же текстовым событиям, которые показаны в правой сводке,
+        а также по исходным детекциям. Все результаты ведут к нужному кадру.
+        """
+        query = self._normalize_search_text(self.search_input.text())
         self.search_list.clear()
         if not query:
             return
-        found = 0
+
+        terms = self._search_terms(query)
+        matches = []
+
+        def matches_query(*values):
+            haystack = self._normalize_search_text(" ".join(
+                str(value) for value in values if value is not None
+            ))
+            return any(term in haystack for term in terms)
+
+        # 1. Основной источник — timeline. Это те же события, что отображаются
+        # справа в блоке «События на видео».
+        timeline = self.analysis_data.get("timeline", []) or []
+        for event in timeline:
+            description = event.get("description", event.get("type", "Событие"))
+            event_type = event.get("type", "")
+            if matches_query(description, event_type):
+                t = float(event.get("t", 0) or 0)
+                frame_idx = int(round(t * self.fps)) if self.fps > 0 else 0
+                time_label = event.get("timecode") or f"{t:.1f} с"
+                text = f"{time_label}  ·  {description}"
+                matches.append((t, 0, text, frame_idx))
+
+        # 2. Поиск по сводкам отдельных кадров. Он полезен для запросов вроде
+        # «машина», даже если в timeline для неё не сформировалось событие.
         for rec in self.records:
-            summary = rec.get("summary", {})
-            summary_str = " ".join(str(key).lower() for key in summary.keys())
-            ru_summary = " ".join(CLASS_RU.get(key.lower(), key.lower()) for key in summary.keys())
-            if query in summary_str or query in ru_summary:
-                translated = [f"{CLASS_RU.get(key, key)}: {count}" for key, count in summary.items()]
-                item_text = f"{float(rec.get('time_sec', 0)):.1f} с  ·  " + (
-                    ", ".join(translated) if translated else "Объектов не обнаружено"
+            summary = rec.get("summary", {}) or {}
+            summary_parts = []
+            for class_name, count in summary.items():
+                ru_name = CLASS_RU.get(str(class_name).lower(), str(class_name))
+                summary_parts.append(f"{ru_name} {class_name} {count}")
+            if matches_query(*summary_parts):
+                t = float(rec.get("time_sec", 0) or 0)
+                translated = [
+                    f"{CLASS_RU.get(key, key)}: {count}"
+                    for key, count in summary.items()
+                ]
+                text = f"{t:05.1f} с  ·  Детекции: " + (
+                    ", ".join(translated) if translated else "объекты не обнаружены"
                 )
-                item = QListWidgetItem(item_text)
-                item.setData(Qt.UserRole, int(rec.get("frame_index", 0)))
-                self.search_list.addItem(item)
-                found += 1
-        if not found:
+                frame_idx = int(rec.get("frame_index", round(t * self.fps)) or 0)
+                matches.append((t, 1, text, frame_idx))
+
+        # Сводка сцены не привязана к одному событию, поэтому открывает начало.
+        scene = self.analysis_data.get("scene", {}) or {}
+        scene_text = scene.get("text", "")
+        if scene_text and matches_query(scene_text):
+            matches.append((0.0, 2, f"00:00  ·  Общая сводка: {scene_text}", 0))
+
+        # Убираем точные дубли и сортируем результаты по времени.
+        unique = {}
+        for entry in matches:
+            unique[(entry[3], entry[2])] = entry
+        matches = sorted(unique.values(), key=lambda entry: (entry[0], entry[1]))
+
+        if not matches:
             self.search_list.addItem(QListWidgetItem("Совпадений не найдено"))
+            return
+
+        for _t, _kind, item_text, frame_idx in matches:
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, frame_idx)
+            self.search_list.addItem(item)
 
     def _on_search_clicked(self, item):
         frame_idx = item.data(Qt.UserRole)
@@ -1350,11 +1905,14 @@ class PageResult(QWidget):
         if not ok:
             return
         self.current_frame_idx = frame_idx
-        self.slider.blockSignals(True)
-        self.slider.setValue(frame_idx)
-        self.slider.blockSignals(False)
+        for timeline in (self.slider, self.fullscreen_slider):
+            timeline.blockSignals(True)
+            timeline.setValue(frame_idx)
+            timeline.blockSignals(False)
         self._update_time_label()
+        self._current_raw_frame = frame.copy()
         self.result_video.setPixmap(self._pixmap_for_frame(frame, frame_idx))
+        self._refresh_fullscreen_frame()
 
     def _export_video(self):
         if not self.video_path or not self.records:
@@ -1422,18 +1980,66 @@ class PageResult(QWidget):
 
 class PageSettings(QWidget):
     apply_requested = pyqtSignal(str, float, str, str)
+    theme_changed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        root = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+        scroll_area = QScrollArea()
+        self.scroll_area = scroll_area
+        self.scroll_content = None
+        scroll_area.setObjectName("settingsScroll")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_content = QWidget()
+        self.scroll_content = scroll_content
+        scroll_content.setObjectName("settingsContent")
+        scroll_content.setMinimumWidth(0)
+        scroll_content.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        root = QVBoxLayout(scroll_content)
         root.setContentsMargins(34, 30, 34, 26)
         root.setSpacing(21)
+        root.setSizeConstraint(QVBoxLayout.SetNoConstraint)
+        scroll_area.setWidget(scroll_content)
+        outer_layout.addWidget(scroll_area)
         root.addWidget(page_heading(
             "Рабочая область / 04", "Настройки",
-            "Управляйте моделью детекции и параметрами обработки.",
+            "Управляйте внешним видом приложения, моделями и параметрами обработки.",
         ))
 
+        appearance_card = panel()
+        appearance_card.setMinimumWidth(0)
+        appearance_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        appearance_layout = set_card_layout(appearance_card, margins=(18, 15, 18, 15), spacing=8)
+        appearance_layout.addWidget(label("Внешний вид", "sectionTitle"))
+        appearance_description = label(
+            "Выберите оформление рабочего пространства. Настройка сохранится после перезапуска.", "subtitle"
+        )
+        appearance_description.setWordWrap(True)
+        appearance_layout.addWidget(appearance_description)
+        appearance_row = QHBoxLayout()
+        appearance_row.addWidget(label("Тема интерфейса", "muted"))
+        appearance_row.addStretch(1)
+        self.theme_switch = SwitchControl("Светлая", "Тёмная", icon="theme")
+        self.theme_switch.setToolTip("Переключить светлую или тёмную тему")
+        appearance_row.addWidget(self.theme_switch)
+        appearance_layout.addLayout(appearance_row)
+        # Тему меняем не в момент клика, а когда ползунок уже доехал: так
+        # анимация идёт плавно, как у переключателя рамок. singleShot(0) даёт
+        # Qt отрисовать финальный кадр до тяжёлой перестройки стилей.
+        self.theme_switch.settled.connect(
+            lambda checked: QTimer.singleShot(
+                0, lambda: self.theme_changed.emit("dark" if checked else "light")
+            )
+        )
+        root.addWidget(appearance_card)
+
         model_card = panel()
+        model_card.setMinimumWidth(0)
+        model_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         model_layout = set_card_layout(model_card)
         model_header = QHBoxLayout()
         model_header.addWidget(label("Модель компьютерного зрения", "sectionTitle"))
@@ -1441,14 +2047,20 @@ class PageSettings(QWidget):
         self.model_status = label("YOLO", "pill")
         model_header.addWidget(self.model_status)
         model_layout.addLayout(model_header)
-        model_layout.addWidget(label(
+        model_description = label(
             "Основная YOLO обнаруживает объекты. При необходимости можно подключить отдельные веса ДТП и дорожных знаков.", "subtitle"
-        ))
+        )
+        model_description.setWordWrap(True)
+        model_layout.addWidget(model_description)
         weights_row = QHBoxLayout()
         default_weights = str(Path(__file__).resolve().with_name("road_all.pt")) if Path(__file__).resolve().with_name("road_all.pt").is_file() else "yolov8n.pt"
         self.weights_edit = QLineEdit(default_weights)
         self.weights_edit.setPlaceholderText("Путь к файлу весов .pt")
+        self.weights_edit.setMinimumHeight(42)
+        self.weights_edit.setMinimumWidth(0)
+        self.weights_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.btn_weights = QPushButton("Обзор…")
+        self.btn_weights.setMinimumHeight(42)
         self.btn_weights.clicked.connect(self._browse_weights)
         weights_row.addWidget(self.weights_edit, 1)
         weights_row.addWidget(self.btn_weights)
@@ -1456,8 +2068,14 @@ class PageSettings(QWidget):
         model_layout.addWidget(label("Дополнительные модели (необязательно)", "sectionTitle"))
         self.accident_weights_edit = QLineEdit()
         self.accident_weights_edit.setPlaceholderText("Путь к весам модели ДТП (.pt)")
+        self.accident_weights_edit.setMinimumHeight(42)
+        self.accident_weights_edit.setMinimumWidth(0)
+        self.accident_weights_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.road_weights_edit = QLineEdit()
         self.road_weights_edit.setPlaceholderText("Путь к весам дорожных знаков и переходов (.pt)")
+        self.road_weights_edit.setMinimumHeight(42)
+        self.road_weights_edit.setMinimumWidth(0)
+        self.road_weights_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         model_layout.addWidget(self.accident_weights_edit)
         model_layout.addWidget(self.road_weights_edit)
         root.addWidget(model_card)
@@ -1470,6 +2088,7 @@ class PageSettings(QWidget):
             "subtitle",
         ))
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.setSpacing(12)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.conf_combo = QComboBox()
@@ -1488,6 +2107,8 @@ class PageSettings(QWidget):
         root.addWidget(params_card)
 
         future_card = panel("subCard")
+        future_card.setMinimumWidth(0)
+        future_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         future_layout = QHBoxLayout(future_card)
         future_layout.setContentsMargins(18, 17, 18, 17)
         future_layout.setSpacing(14)
@@ -1518,6 +2139,29 @@ class PageSettings(QWidget):
         self.btn_apply.clicked.connect(self._apply)
         bottom.addWidget(self.btn_apply)
         root.addLayout(bottom)
+
+    def set_theme(self, theme):
+        light = theme == "light"
+        self.theme_switch.set_theme(theme)
+        page_bg = "#F1F5F9" if light else "#0B1018"
+        card_bg = "#FFFFFF" if light else "#111925"
+        text = "#20384E" if light else "#E7ECF5"
+        self.setStyleSheet(
+            f"QWidget#settingsContent {{ background:{page_bg}; color:{text}; }}"
+            f"QLabel {{ background:transparent; color:{text}; }}"
+        )
+        self.scroll_area.setStyleSheet(
+            f"QScrollArea#settingsScroll {{ background:{page_bg}; border:0; }}"
+            f"QScrollArea#settingsScroll QWidget#qt_scrollarea_viewport {{ background:{page_bg}; }}"
+        )
+        self.scroll_area.viewport().setStyleSheet(f"background:{page_bg};")
+        self.scroll_content.setStyleSheet(f"QWidget#settingsContent {{ background:{page_bg}; }}"f"QLabel {{ background:transparent; color:{text}; }}")
+        for card in self.scroll_content.findChildren(QFrame):
+            if card.objectName() in ("card", "subCard"):
+                card.setStyleSheet(
+                    f"QFrame#{card.objectName()} {{ background:{card_bg}; "
+                    f"border:1px solid {'#D7E1EB' if light else '#253144'}; border-radius:12px; }}"
+                )
 
     def _browse_weights(self):
         path, _ = QFileDialog.getOpenFileName(self, "Выберите веса YOLO", "", "Веса модели (*.pt);;Все файлы (*.*)")
@@ -1555,9 +2199,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SceneVision — анализ видео")
-        self.resize(1440, 920)
+        self.resize(1440, 900)
         self.setMinimumSize(1180, 760)
-        self.setStyleSheet(APP_STYLE)
+        self.settings = QSettings("SceneVision", "Desktop")
+        self.current_theme = self.settings.value("theme", "light")
+        self.setStyleSheet(LIGHT_APP_STYLE if self.current_theme == "light" else APP_STYLE)
 
         self.model = None
         self.model_thread = None
@@ -1596,14 +2242,14 @@ class MainWindow(QMainWindow):
         mark.setFixedSize(39, 39)
         mark_layout = QVBoxLayout(mark)
         mark_layout.setContentsMargins(0, 0, 0, 0)
-        mark_label = QLabel("SV")
+        mark_label = QLabel("E")
         mark_label.setAlignment(Qt.AlignCenter)
         mark_label.setStyleSheet("color:white; font-size:13px; font-weight:800; background:transparent;")
         mark_layout.addWidget(mark_label)
         brand_text = QVBoxLayout()
         brand_text.setSpacing(1)
-        brand_text.addWidget(label("SceneVision", "brandTitle"))
-        brand_text.addWidget(label("VIDEO INTELLIGENCE", "brandCaption"))
+        brand_text.addWidget(label("ELTEX", "brandTitle"))
+        brand_text.addWidget(label("VIDEO ANALYTICS", "brandCaption"))
         brand_row.addWidget(mark)
         brand_row.addLayout(brand_text, 1)
         side.addLayout(brand_row)
@@ -1667,20 +2313,64 @@ class MainWindow(QMainWindow):
         self.page_new.start_analysis.connect(self._start_processing)
         self.page_proc.stop_clicked.connect(self._stop_processing)
         self.page_set.apply_requested.connect(self._apply_model_settings)
+        self.page_set.theme_changed.connect(self._apply_theme)
+        self.page_set.theme_switch.blockSignals(True)
+        self.page_set.theme_switch.setChecked(self.current_theme == "dark")
+        self.page_set.theme_switch.blockSignals(False)
+        self.page_res.set_theme(self.current_theme)
+        self.page_new.set_theme(self.current_theme)
+        self.page_proc.set_theme(self.current_theme)
+        self.page_set.set_theme(self.current_theme)
         self.statusBar().showMessage("Инициализация приложения…")
 
         self._load_model(self.model_weights, initial=True)
+
+    def _apply_theme(self, theme):
+        if theme not in ("light", "dark"):
+            return
+        self.current_theme = theme
+        self.settings.setValue("theme", theme)
+        self.setStyleSheet(LIGHT_APP_STYLE if theme == "light" else APP_STYLE)
+        self.page_res.set_theme(theme)
+        self.page_new.set_theme(theme)
+        self.page_proc.set_theme(theme)
+        self.page_set.set_theme(theme)
+        self.page_set.theme_switch.blockSignals(True)
+        self.page_set.theme_switch.setChecked(theme == "dark")
+        self.page_set.theme_switch.blockSignals(False)
+        # Цвета текста и фона синхронно обновляются на всех страницах.
+        self.statusBar().showMessage(
+            "Включена светлая тема" if theme == "light" else "Включена тёмная тема", 2500
+        )
 
     def _set_nav(self, index):
         self.btn_nav_new.setChecked(index == 0)
         self.btn_nav_res.setChecked(index == 1)
         self.btn_nav_set.setChecked(index == 2)
 
+    def _analysis_is_running(self):
+        return self.video_thread is not None and self.video_thread.isRunning()
+
+    def _show_processing_page(self, notify=False):
+        """Возвращает пользователя к текущему анализу, не сбрасывая его состояние."""
+        self.stack.setCurrentWidget(self.page_proc)
+        self._set_nav(0)
+        self.page_proc.btn_stop.setEnabled(self._analysis_is_running())
+        self.statusBar().showMessage(
+            "Анализ выполняется — прогресс и журнал обновляются.", 4000
+        )
+
     def _switch_page(self, index):
+        # Пока идёт анализ, «Новый анализ» и «Результаты» не должны
+        # показывать пустую форму вместо активного процесса.
+        if self._analysis_is_running() and index in (0, 1):
+            self._show_processing_page(notify=(index == 0))
+            return
+
         if index == 1:
             if not self.all_records or not self.current_video_path:
                 self.statusBar().showMessage("Сначала выполните анализ видео.", 3500)
-                self._set_nav(0 if self.stack.currentIndex() != 1 else 0)
+                self._set_nav(0)
                 return
             self.page_res.update_results(
                 self.all_records, self.last_frame, self.current_video_path,
@@ -1693,7 +2383,7 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.page_new)
             self._set_nav(0)
         elif index == 2:
-            self.stack.setCurrentWidget(self.page_set)
+            self.stack.setCurrentIndex(3)
             self._set_nav(2)
 
     def _load_model(self, weights, initial=False, accident_weights=None, road_weights=None):
@@ -1774,8 +2464,8 @@ class MainWindow(QMainWindow):
         if self.model is None:
             QMessageBox.warning(self, "Модель не готова", "Дождитесь загрузки модели или выберите веса в настройках.")
             return
-        if self.video_thread and self.video_thread.isRunning():
-            QMessageBox.information(self, "Обработка", "Анализ уже выполняется.")
+        if self._analysis_is_running():
+            self._show_processing_page(notify=True)
             return
         self.all_records.clear()
         self.analysis_data = {}
@@ -1857,6 +2547,12 @@ class MainWindow(QMainWindow):
         if self.video_thread and self.video_thread.isRunning():
             self.page_proc.lbl_status.setText("Остановка обработки…")
             self.video_thread.stop()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            if self.isVisible() and not self.isMinimized() and self._analysis_is_running():
+                QTimer.singleShot(0, lambda: self._show_processing_page(notify=False))
 
     def closeEvent(self, event):
         if self.video_thread and self.video_thread.isRunning():
