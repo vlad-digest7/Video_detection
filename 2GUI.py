@@ -11,6 +11,7 @@ import math
 import sys
 import time
 import json
+import re
 from types import SimpleNamespace
 from collections import Counter
 from pathlib import Path
@@ -38,6 +39,13 @@ from main import (
     open_video, open_camera, open_rtsp, video_info, live_info,
     LatestFrameReader, iter_frames, save_result,
 )
+
+try:
+    import qwen_describer as qd
+    QD_IMPORT_ERROR = ""
+except Exception as _qd_import_exc:
+    qd = None
+    QD_IMPORT_ERROR = f"{type(_qd_import_exc).__name__}: {_qd_import_exc}"
 
 
 class SwitchControl(QAbstractButton):
@@ -755,6 +763,34 @@ class ExportThread(QThread):
             self.export_completed.emit(self.output_path)
 
 
+class DescriptionThread(QThread):
+    """Генерирует описание по result_llm.json в отдельном потоке."""
+    status = pyqtSignal(str)
+    text_chunk = pyqtSignal(str)
+    done = pyqtSignal(str, bool)
+    failed = pyqtSignal(str)
+
+    def __init__(self, describer, digest, lang="ru", max_new_tokens=700,
+                 temperature=0.4, parent=None):
+        super().__init__(parent)
+        self.describer = describer
+        self.digest = digest
+        self.lang = lang
+        self.max_new_tokens = int(max_new_tokens)
+        self.temperature = float(temperature)
+
+    def run(self):
+        try:
+            text = self.describer.describe(
+                self.digest, lang=self.lang, max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature, on_text=self.text_chunk.emit,
+                status=self.status.emit,
+            )
+            self.done.emit(text, self.describer.cancelled)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Screen: New analysis
 # ---------------------------------------------------------------------------
@@ -1339,6 +1375,9 @@ class PageProcessing(QWidget):
 # ---------------------------------------------------------------------------
 
 class PageResult(QWidget):
+    generate_requested = pyqtSignal()
+    stop_generation_requested = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.records = []
@@ -1349,6 +1388,10 @@ class PageResult(QWidget):
         self.is_playing = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._next_frame)
+        self.search_refresh_timer = QTimer(self)
+        self.search_refresh_timer.setSingleShot(True)
+        self.search_refresh_timer.setInterval(240)
+        self.search_refresh_timer.timeout.connect(self._do_search)
         self.total_frames = 0
         self.fps = 30.0
         self.current_frame_idx = 0
@@ -1357,6 +1400,8 @@ class PageResult(QWidget):
         self.progress_dialog = None
         self._last_results_signature = None
         self.show_clean_video = False
+        self._llm_busy = False
+        self._llm_text = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 20, 28, 18)
@@ -1495,21 +1540,40 @@ class PageResult(QWidget):
         left.addWidget(video_card, 9)
 
         search_card = panel()
-        search_layout = set_card_layout(search_card, margins=(16, 14, 16, 14), spacing=10)
-        search_layout.addWidget(label("Поиск по детекциям", "sectionTitle"))
+        search_layout = set_card_layout(search_card, margins=(16, 14, 16, 14), spacing=9)
+        search_head = QHBoxLayout()
+        search_head.addWidget(label("Поиск по видео", "sectionTitle"))
+        search_head.addStretch(1)
+        self.search_mode_combo = QComboBox()
+        self.search_mode_combo.addItem("Всё", "all")
+        self.search_mode_combo.addItem("Qwen", "qwen")
+        self.search_mode_combo.addItem("События", "events")
+        self.search_mode_combo.addItem("Детекции", "detections")
+        self.search_mode_combo.setFixedWidth(126)
+        self.search_mode_combo.setFixedHeight(36)
+        self.search_mode_combo.setToolTip(
+            "Выберите, где искать: в описании Qwen, событиях или исходных детекциях."
+        )
+        self.search_mode_combo.currentIndexChanged.connect(self._do_search)
+        search_head.addWidget(self.search_mode_combo)
+        search_layout.addLayout(search_head)
+
         search_row = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Например: машина, человек, светофор…")
+        self.search_input.setPlaceholderText(
+            "Например: перекрытие, машина, опасное сближение…"
+        )
+        self.search_input.setMinimumHeight(42)
+        self.search_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search_input.returnPressed.connect(self._do_search)
         self.search_input.textChanged.connect(self._do_search)
-        self.btn_find = QPushButton("Найти")
-        self.btn_find.setObjectName("primaryBtn")
-        self.btn_find.clicked.connect(self._do_search)
+        # Поле занимает всю ширину строки; поиск также запускается по мере ввода.
         search_row.addWidget(self.search_input, 1)
-        search_row.addWidget(self.btn_find)
         search_layout.addLayout(search_row)
+
+        self.search_count_label = label("Поиск по всем доступным источникам", "smallMuted")
+        search_layout.addWidget(self.search_count_label)
         self.search_list = QListWidget()
-        # Keep search useful while giving the video viewport priority.
         self.search_list.setMinimumHeight(95)
         self.search_list.setMaximumHeight(155)
         self.search_list.itemClicked.connect(self._on_search_clicked)
@@ -1523,17 +1587,43 @@ class PageResult(QWidget):
         title_row = QHBoxLayout()
         title_row.addWidget(label("Сводка по кадрам", "sectionTitle"))
         title_row.addStretch()
-        title_row.addWidget(label("ЭТАП 1", "pill"))
+        title_row.addWidget(label("QWEN2.5", "pill"))
         right_layout.addLayout(title_row)
-        future_card = panel("subCard")
-        future_card.setMinimumWidth(0)
-        future_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        future_layout = QVBoxLayout(future_card)
-        future_layout.setContentsMargins(13, 12, 13, 12)
-        future_layout.setSpacing(5)
-        future_layout.addWidget(label("Текстовое описание сцены", "sectionTitle"))
-        future_layout.addWidget(label("Появится после подключения Qwen2.5. Сейчас отображаются фактические сводки детектора.", "smallMuted"))
-        right_layout.addWidget(future_card)
+        llm_card = panel("subCard")
+        llm_card.setMinimumWidth(0)
+        llm_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        llm_layout = QVBoxLayout(llm_card)
+        llm_layout.setContentsMargins(13, 12, 13, 12)
+        llm_layout.setSpacing(7)
+        llm_head = QHBoxLayout()
+        llm_head.addWidget(label("Текстовое описание сцены", "sectionTitle"))
+        llm_head.addStretch()
+        self.btn_llm_copy = QPushButton("Копировать")
+        self.btn_llm_copy.setEnabled(False)
+        self.btn_llm_copy.clicked.connect(self._copy_llm)
+        self.btn_llm = QPushButton("Сгенерировать описание")
+        self.btn_llm.setObjectName("primaryBtn")
+        self.btn_llm.clicked.connect(self._on_llm_button)
+        self.btn_llm.setMinimumHeight(36)
+        self.btn_llm_copy.setMinimumHeight(36)
+        llm_head.addWidget(self.btn_llm_copy)
+        llm_head.addWidget(self.btn_llm)
+        llm_layout.addLayout(llm_head)
+        self.llm_status = label(
+            "Описание ещё не создано. Нажмите «Сгенерировать описание».", "smallMuted"
+        )
+        self.llm_status.setWordWrap(True)
+        llm_layout.addWidget(self.llm_status)
+        self.llm_text = QTextBrowser()
+        self.llm_text.setOpenLinks(False)
+        self.llm_text.anchorClicked.connect(self._on_desc_link_clicked)
+        self.llm_text.setPlaceholderText(
+            "Здесь появится описание ролика с хронологией событий и таймкодами."
+        )
+        self.llm_text.setMinimumHeight(135)
+        self.llm_text.setMaximumHeight(260)
+        llm_layout.addWidget(self.llm_text)
+        right_layout.addWidget(llm_card)
         self.desc_text = QTextBrowser()
         self.desc_text.setOpenLinks(False)
         self.desc_text.anchorClicked.connect(self._on_desc_link_clicked)
@@ -1560,6 +1650,7 @@ class PageResult(QWidget):
         if signature == self._last_results_signature and self.cap and self.cap.isOpened():
             return
         self._last_results_signature = signature
+        self.llm_reset()
         self.records = list(records)
         self.analysis_data = analysis_data or {}
         self.btn_clean_video.blockSignals(True)
@@ -1607,13 +1698,17 @@ class PageResult(QWidget):
             bg, fg, muted, border, link = "#FFFFFF", "#26384B", "#64758A", "#DCE3EC", "#1769AA"
         else:
             bg, fg, muted, border, link = "#0B121D", "#DDE6F3", "#7D8CA2", "#243044", "#80B2FF"
-        self.desc_text.setStyleSheet(
+        browser_style = (
             f"QTextBrowser {{ background:{bg}; color:{fg}; border:1px solid {border}; "
             "border-radius:8px; padding:10px; }}"
         )
+        self.desc_text.setStyleSheet(browser_style)
+        self.llm_text.setStyleSheet(browser_style)
         self._summary_colors = (fg, muted, border, link)
         if self.records:
             self._populate_summary()
+        if self._llm_text:
+            self._render_llm()
 
     def _show_properties(self):
         self.properties_dialog.show()
@@ -1668,6 +1763,115 @@ class PageResult(QWidget):
         if not rows:
             rows = [f"<p style='color:{muted};'>Нет записей для отображения.</p>"]
         self.desc_text.setHtml("".join(rows))
+
+    @staticmethod
+    def _restyle(widget, object_name):
+        widget.setObjectName(object_name)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def set_llm_available(self, available: bool, reason: str = ""):
+        self.btn_llm.setEnabled(bool(available))
+        if not available:
+            self.llm_status.setText(
+                reason or "Модуль qwen_describer.py не найден рядом с GUI."
+            )
+
+    def llm_reset(self):
+        self._llm_busy = False
+        self._llm_text = ""
+        self.llm_text.clear()
+        self.btn_llm.setText("Сгенерировать описание")
+        self._restyle(self.btn_llm, "primaryBtn")
+        self.btn_llm_copy.setEnabled(False)
+        if qd is None:
+            self.btn_llm.setEnabled(False)
+            self.llm_status.setText(
+                "Qwen недоступна: положите qwen_describer.py рядом с GUI и проверьте зависимости."
+            )
+        else:
+            self.btn_llm.setEnabled(True)
+            self.llm_status.setText(
+                "Описание ещё не создано. Нажмите «Сгенерировать описание»."
+            )
+
+    def llm_set_busy(self, message: str):
+        self._llm_busy = True
+        self._llm_text = ""
+        self.llm_text.clear()
+        self.btn_llm.setText("Остановить")
+        self._restyle(self.btn_llm, "dangerBtn")
+        self.btn_llm_copy.setEnabled(False)
+        self.llm_status.setText(message)
+
+    def llm_status_message(self, message: str):
+        self.llm_status.setText(message)
+
+    def llm_append(self, chunk: str):
+        self._llm_text += chunk
+        self.llm_text.setPlainText(self._llm_text)
+        scrollbar = self.llm_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        # Во время потоковой генерации обновляем поиск с небольшой задержкой,
+        # чтобы не перерисовывать список на каждом токене Qwen.
+        if self.search_input.text().strip():
+            self.search_refresh_timer.start()
+
+    def llm_finish(self, text: str = "", cancelled: bool = False, cached: bool = False):
+        self._llm_busy = False
+        if text:
+            self._llm_text = text
+        self.btn_llm.setText(
+            "Сгенерировать заново" if self._llm_text else "Сгенерировать описание"
+        )
+        self._restyle(self.btn_llm, "primaryBtn")
+        self.btn_llm_copy.setEnabled(bool(self._llm_text))
+        if self._llm_text:
+            self._render_llm()
+        if cached:
+            self.llm_status.setText(
+                "Показано сохранённое описание. «Сгенерировать заново» создаст новое."
+            )
+        elif cancelled:
+            suffix = " Показан частичный текст." if self._llm_text else ""
+            self.llm_status.setText("Генерация остановлена." + suffix)
+        elif self._llm_text:
+            self.llm_status.setText(
+                "Описание готово. Нажмите на таймкод, чтобы перейти к кадру."
+            )
+        else:
+            self.llm_status.setText("Модель не вернула текст. Попробуйте ещё раз.")
+        self.search_refresh_timer.stop()
+        self._do_search()
+
+    def llm_fail(self, message: str):
+        self._llm_busy = False
+        self.btn_llm.setText("Сгенерировать описание")
+        self._restyle(self.btn_llm, "primaryBtn")
+        self.btn_llm_copy.setEnabled(bool(self._llm_text))
+        self.llm_status.setText(f"Ошибка: {message}")
+
+    def _render_llm(self):
+        fg, _muted, _border, link = getattr(
+            self, "_summary_colors", ("#26384B", "#64758A", "#DCE3EC", "#1769AA")
+        )
+        if qd is None:
+            self.llm_text.setPlainText(self._llm_text)
+        else:
+            self.llm_text.setHtml(
+                qd.description_to_html(self._llm_text, self.fps, fg, link)
+            )
+
+    def _on_llm_button(self):
+        if self._llm_busy:
+            self.stop_generation_requested.emit()
+        else:
+            self.generate_requested.emit()
+
+    def _copy_llm(self):
+        if self._llm_text:
+            QApplication.clipboard().setText(self._llm_text)
+            self.llm_status.setText("Текст описания скопирован в буфер обмена.")
 
     def _toggle_clean_video(self, checked: bool):
         """Toggle the preview between the source video and the annotated view."""
@@ -1787,21 +1991,27 @@ class PageResult(QWidget):
 
     @staticmethod
     def _normalize_search_text(value):
-        """Нормализует текст для поиска: регистр, ё/е и лишние пробелы."""
+        """Нормализует текст поиска, не меняя исходный текст результата."""
         return " ".join(str(value or "").lower().replace("ё", "е").split())
 
     @classmethod
     def _search_terms(cls, query):
-        """Возвращает варианты запроса, учитывая русские и английские названия."""
+        """Небольшой словарь частых формулировок и синонимов для русскоязычного поиска."""
         query = cls._normalize_search_text(query)
         aliases = {
             "машина": ("машина", "автомобиль", "легковой автомобиль", "car"),
             "машины": ("машина", "автомобиль", "легковой автомобиль", "car"),
+            "машинами": ("машина", "автомобиль", "легковой автомобиль", "car"),
             "авто": ("авто", "автомобиль", "машина", "car"),
             "автомобиль": ("автомобиль", "машина", "car"),
             "автомобили": ("автомобиль", "машина", "car"),
+            "автомобилями": ("автомобиль", "машина", "car"),
+            "легковая": ("легковой автомобиль", "легковой", "машина", "автомобиль", "car"),
+            "легковые": ("легковой автомобиль", "легковой", "машина", "автомобиль", "car"),
             "человек": ("человек", "люди", "person"),
             "люди": ("человек", "люди", "person"),
+            "пешеход": ("пешеход", "человек", "person"),
+            "пешеходы": ("пешеход", "человек", "person"),
             "мотоцикл": ("мотоцикл", "motorcycle"),
             "грузовик": ("грузовик", "truck"),
             "автобус": ("автобус", "bus"),
@@ -1809,80 +2019,199 @@ class PageResult(QWidget):
             "велосипед": ("велосипед", "велосипедист", "bicycle", "cyclist"),
             "дтп": ("дтп", "авария", "столкновение", "accident"),
             "авария": ("авария", "дтп", "столкновение", "accident"),
+            "столкновение": ("столкновение", "авария", "дтп", "collision"),
         }
         return aliases.get(query, (query,))
 
-    def _do_search(self, *_args):
-        """Ищет по тем же текстовым событиям, которые показаны в правой сводке,
-        а также по исходным детекциям. Все результаты ведут к нужному кадру.
-        """
-        query = self._normalize_search_text(self.search_input.text())
-        self.search_list.clear()
-        if not query:
-            return
+    @staticmethod
+    def _search_timecode_seconds(value, fallback=0.0):
+        """Читает MM:SS, если оно есть; иначе возвращает fallback."""
+        match = re.search(r"(?<!\d)(\d{1,2}):([0-5]\d)(?!\d)", str(value or ""))
+        if not match:
+            return float(fallback or 0.0)
+        return int(match.group(1)) * 60 + int(match.group(2))
 
-        terms = self._search_terms(query)
-        matches = []
+    @staticmethod
+    def _search_time_label(seconds):
+        seconds = max(0, int(round(float(seconds or 0))))
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
-        def matches_query(*values):
-            haystack = self._normalize_search_text(" ".join(
-                str(value) for value in values if value is not None
-            ))
-            return any(term in haystack for term in terms)
+    @staticmethod
+    def _search_excerpt(text, limit=145):
+        text = " ".join(str(text or "").split())
+        if len(text) > limit:
+            return text[:limit - 1].rstrip() + "…"
+        return text
 
-        # 1. Основной источник — timeline. Это те же события, что отображаются
-        # справа в блоке «События на видео».
+    def _query_matches(self, query, *values):
+        haystack = self._normalize_search_text(" ".join(
+            str(value) for value in values if value is not None
+        ))
+        return bool(haystack) and any(term and term in haystack for term in self._search_terms(query))
+
+    def _search_qwen(self, query):
+        """Ищет по сгенерированному Qwen тексту и связывает абзацы с таймкодами."""
+        text = (self._llm_text or "").strip()
+        if not text:
+            return []
+
+        timecodes = list(re.finditer(r"(?<!\d)(\d{1,2}):([0-5]\d)(?!\d)", text))
+        segments = []
+        if not timecodes:
+            if self._query_matches(query, text):
+                segments.append((0.0, text))
+        else:
+            prefix = text[:timecodes[0].start()].strip(" \n\t:—-•")
+            if prefix and self._query_matches(query, prefix):
+                segments.append((0.0, prefix))
+            for index, match in enumerate(timecodes):
+                segment_end = timecodes[index + 1].start() if index + 1 < len(timecodes) else len(text)
+                segment = text[match.start():segment_end].strip()
+                if self._query_matches(query, segment):
+                    seconds = int(match.group(1)) * 60 + int(match.group(2))
+                    segments.append((float(seconds), segment))
+
+        results = []
+        for seconds, segment in segments:
+            frame_idx = int(round(seconds * self.fps)) if self.fps > 0 else 0
+            excerpt = self._search_excerpt(segment)
+            results.append((seconds, 0, "QWEN", f"{self._search_time_label(seconds)}  ·  {excerpt}", frame_idx))
+        return results
+
+    def _search_events(self, query):
+        """Ищет по временной шкале событий и по общей сводке сцены."""
+        results = []
         timeline = self.analysis_data.get("timeline", []) or []
         for event in timeline:
             description = event.get("description", event.get("type", "Событие"))
             event_type = event.get("type", "")
-            if matches_query(description, event_type):
-                t = float(event.get("t", 0) or 0)
-                frame_idx = int(round(t * self.fps)) if self.fps > 0 else 0
-                time_label = event.get("timecode") or f"{t:.1f} с"
-                text = f"{time_label}  ·  {description}"
-                matches.append((t, 0, text, frame_idx))
+            if not self._query_matches(query, description, event_type):
+                continue
+            seconds = float(event.get("t", self._search_timecode_seconds(event.get("timecode"))) or 0)
+            frame_idx = int(round(seconds * self.fps)) if self.fps > 0 else 0
+            time_label = event.get("timecode") or self._search_time_label(seconds)
+            text = f"{time_label}  ·  {self._search_excerpt(description)}"
+            results.append((seconds, 1, "СОБЫТИЕ", text, frame_idx))
 
-        # 2. Поиск по сводкам отдельных кадров. Он полезен для запросов вроде
-        # «машина», даже если в timeline для неё не сформировалось событие.
-        for rec in self.records:
-            summary = rec.get("summary", {}) or {}
-            summary_parts = []
-            for class_name, count in summary.items():
-                ru_name = CLASS_RU.get(str(class_name).lower(), str(class_name))
-                summary_parts.append(f"{ru_name} {class_name} {count}")
-            if matches_query(*summary_parts):
-                t = float(rec.get("time_sec", 0) or 0)
-                translated = [
-                    f"{CLASS_RU.get(key, key)}: {count}"
-                    for key, count in summary.items()
-                ]
-                text = f"{t:05.1f} с  ·  Детекции: " + (
-                    ", ".join(translated) if translated else "объекты не обнаружены"
-                )
-                frame_idx = int(rec.get("frame_index", round(t * self.fps)) or 0)
-                matches.append((t, 1, text, frame_idx))
-
-        # Сводка сцены не привязана к одному событию, поэтому открывает начало.
         scene = self.analysis_data.get("scene", {}) or {}
         scene_text = scene.get("text", "")
-        if scene_text and matches_query(scene_text):
-            matches.append((0.0, 2, f"00:00  ·  Общая сводка: {scene_text}", 0))
+        if scene_text and self._query_matches(query, scene_text):
+            results.append((0.0, 2, "СВОДКА", f"00:00  ·  {self._search_excerpt(scene_text)}", 0))
+        return results
 
-        # Убираем точные дубли и сортируем результаты по времени.
-        unique = {}
-        for entry in matches:
-            unique[(entry[3], entry[2])] = entry
-        matches = sorted(unique.values(), key=lambda entry: (entry[0], entry[1]))
+    def _search_detections(self, query):
+        """Ищет по классам и атрибутам фактически сохранённых YOLO-детекций."""
+        results = []
+        for record in self.records:
+            summary = record.get("summary", {}) or {}
+            objects = record.get("objects", []) or []
+            matched_objects = []
 
-        if not matches:
-            self.search_list.addItem(QListWidgetItem("Совпадений не найдено"))
+            for obj in objects:
+                class_name = str(obj.get("class", obj.get("name", "")))
+                class_key = class_name.lower()
+                translated = CLASS_RU.get(class_key, CLASS_RU.get(class_name, class_name))
+                confidence = obj.get("confidence", "")
+                object_id = obj.get("track_id", obj.get("id", ""))
+                if self._query_matches(query, class_name, translated, confidence, object_id):
+                    matched_objects.append((translated or class_name, confidence, object_id))
+
+            # Older result files may contain only per-frame summaries, without object details.
+            summary_matches = []
+            for class_name, count in summary.items():
+                translated = CLASS_RU.get(str(class_name).lower(), CLASS_RU.get(str(class_name), str(class_name)))
+                if self._query_matches(query, class_name, translated, count):
+                    summary_matches.append((translated or str(class_name), count))
+
+            if not matched_objects and not summary_matches:
+                continue
+
+            seconds = float(record.get("time_sec", 0) or 0)
+            frame_idx = int(record.get("frame_index", round(seconds * self.fps)) or 0)
+            if matched_objects:
+                counts = Counter(item[0] for item in matched_objects)
+                labels = [f"{name} ×{count}" for name, count in counts.items()]
+                extras = []
+                for _name, confidence, object_id in matched_objects[:3]:
+                    detail = []
+                    if object_id not in (None, ""):
+                        detail.append(f"ID {object_id}")
+                    if confidence not in (None, ""):
+                        try:
+                            detail.append(f"уверенность {float(confidence):.2f}")
+                        except (TypeError, ValueError):
+                            pass
+                    if detail:
+                        extras.append(", ".join(detail))
+                description = ", ".join(labels)
+                if extras:
+                    description += "  ·  " + "; ".join(extras)
+            else:
+                description = ", ".join(f"{name} ×{count}" for name, count in summary_matches)
+
+            results.append((seconds, 3, "ДЕТЕКЦИИ",
+                            f"{self._search_time_label(seconds)}  ·  {self._search_excerpt(description)}",
+                            frame_idx))
+        return results
+
+    def _do_search(self, *_args):
+        """Ищет по выбранному источнику; режим «Всё» объединяет источники."""
+        query = self._normalize_search_text(self.search_input.text())
+        self.search_list.clear()
+        if not query:
+            if hasattr(self, "search_count_label"):
+                scope = self.search_mode_combo.currentData() if hasattr(self, "search_mode_combo") else "all"
+                hints = {
+                    "all": "Поиск по всем доступным источникам",
+                    "qwen": "Поиск в текстовом описании Qwen",
+                    "events": "Поиск в событиях и общей сводке",
+                    "detections": "Поиск по обнаруженным объектам",
+                }
+                self.search_count_label.setText(hints.get(scope, hints["all"]))
             return
 
-        for _t, _kind, item_text, frame_idx in matches:
-            item = QListWidgetItem(item_text)
+        scope = self.search_mode_combo.currentData() if hasattr(self, "search_mode_combo") else "all"
+        searches = {
+            "qwen": [self._search_qwen],
+            "events": [self._search_events],
+            "detections": [self._search_detections],
+            "all": [self._search_qwen, self._search_events, self._search_detections],
+        }
+        results = []
+        for search_function in searches.get(scope, searches["all"]):
+            results.extend(search_function(query))
+
+        # Сохраняем разные источники даже при одинаковом таймкоде: пользователь
+        # должен видеть, откуда именно пришло совпадение.
+        unique = {}
+        for entry in results:
+            seconds, priority, source, text, frame_idx = entry
+            key = (source, frame_idx, self._normalize_search_text(text))
+            unique[key] = entry
+        results = sorted(unique.values(), key=lambda row: (row[0], row[1], row[3]))
+
+        if not results:
+            if scope == "qwen" and not self._llm_text:
+                message = "Сначала сгенерируйте описание Qwen."
+            elif scope == "events" and not (self.analysis_data.get("timeline") or self.analysis_data.get("scene")):
+                message = "В этом результате нет данных о событиях."
+            elif scope == "detections" and not self.records:
+                message = "Нет сохранённых детекций для поиска."
+            else:
+                message = "Совпадений не найдено. Попробуйте другой источник или запрос."
+            self.search_list.addItem(QListWidgetItem(message))
+            self.search_count_label.setText("Найдено: 0")
+            return
+
+        self.search_count_label.setText(f"Найдено совпадений: {len(results)}")
+        max_items = 60
+        for seconds, _priority, source, text, frame_idx in results[:max_items]:
+            item = QListWidgetItem(f"[{source}]  {text}")
             item.setData(Qt.UserRole, frame_idx)
+            item.setToolTip(f"Источник: {source}\nВремя: {self._search_time_label(seconds)}\n{text}")
             self.search_list.addItem(item)
+        if len(results) > max_items:
+            self.search_list.addItem(QListWidgetItem(f"… и ещё {len(results) - max_items} совпадений"))
 
     def _on_search_clicked(self, item):
         frame_idx = item.data(Qt.UserRole)
@@ -2106,29 +2435,84 @@ class PageSettings(QWidget):
         params_layout.addLayout(form)
         root.addWidget(params_card)
 
-        future_card = panel("subCard")
-        future_card.setMinimumWidth(0)
-        future_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        future_layout = QHBoxLayout(future_card)
-        future_layout.setContentsMargins(18, 17, 18, 17)
-        future_layout.setSpacing(14)
-        future_mark = QLabel("LLM")
-        future_mark.setAlignment(Qt.AlignCenter)
-        future_mark.setFixedSize(46, 46)
-        future_mark.setStyleSheet(
-            "background:#19263A; border:1px solid #2B405E; border-radius:10px; "
-            "color:#A6C8FF; font-size:12px; font-weight:800;"
-        )
-        future_layout.addWidget(future_mark, alignment=Qt.AlignTop)
-        future_text = QVBoxLayout()
-        future_text.addWidget(label("Генерация текстового описания", "sectionTitle"))
-        future_text.addWidget(label(
-            "На этом этапе формируется result_llm.json для последующей передачи в Qwen2.5. Сам вызов языковой модели пока не подключён.",
+        llm_card = panel("subCard")
+        llm_card.setMinimumWidth(0)
+        llm_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        llm_layout = set_card_layout(llm_card, margins=(18, 16, 18, 16), spacing=10)
+        llm_header = QHBoxLayout()
+        llm_header.addWidget(label("Генерация текстового описания (Qwen2.5)", "sectionTitle"))
+        llm_header.addStretch()
+        llm_header.addWidget(label("QWEN2.5", "pill"))
+        llm_layout.addLayout(llm_header)
+        llm_description = label(
+            "Qwen составляет связное описание по структурированной сводке result_llm.json. "
+            "Первый запуск может скачать модель из Hugging Face; можно указать локальную папку.",
             "subtitle",
-        ))
-        future_layout.addLayout(future_text, 1)
-        future_layout.addWidget(label("В РАЗРАБОТКЕ", "pillAmber"), alignment=Qt.AlignTop)
-        root.addWidget(future_card)
+        )
+        llm_description.setWordWrap(True)
+        llm_layout.addWidget(llm_description)
+
+        llm_hints = list(qd.MODEL_HINTS) if qd else [
+            "Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct",
+            "Qwen/Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-7B-Instruct",
+        ]
+        llm_model_row = QHBoxLayout()
+        self.llm_model_combo = QComboBox()
+        self.llm_model_combo.setEditable(True)
+        self.llm_model_combo.addItems(llm_hints)
+        self.llm_model_combo.setCurrentText(
+            qd.DEFAULT_MODEL if qd else "Qwen/Qwen2.5-1.5B-Instruct"
+        )
+        self.llm_model_combo.setMinimumHeight(42)
+        self.llm_model_combo.setMinimumWidth(0)
+        self.llm_model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_llm_dir = QPushButton("Папка…")
+        self.btn_llm_dir.setMinimumHeight(42)
+        self.btn_llm_dir.clicked.connect(self._browse_llm_dir)
+        llm_model_row.addWidget(self.llm_model_combo, 1)
+        llm_model_row.addWidget(self.btn_llm_dir)
+        llm_layout.addLayout(llm_model_row)
+
+        llm_form = QFormLayout()
+        llm_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        llm_form.setSpacing(10)
+        self.llm_device_combo = QComboBox()
+        for title, value in (("Автоматически", "auto"), ("Процессор", "cpu"),
+                             ("Видеокарта NVIDIA (CUDA)", "cuda"), ("Mac (MPS)", "mps")):
+            self.llm_device_combo.addItem(title, value)
+        self.llm_device_combo.setMinimumWidth(210)
+        self.llm_device_combo.setMaximumWidth(280)
+        self.llm_tokens_spin = QSpinBox()
+        self.llm_tokens_spin.setRange(200, 2000)
+        self.llm_tokens_spin.setSingleStep(50)
+        self.llm_tokens_spin.setValue(700)
+        self.llm_tokens_spin.setMaximumWidth(130)
+        llm_form.addRow("Устройство", self.llm_device_combo)
+        llm_form.addRow("Максимальная длина, токенов", self.llm_tokens_spin)
+        llm_layout.addLayout(llm_form)
+
+        auto_row = QHBoxLayout()
+        auto_row.addWidget(label("Создавать описание автоматически после анализа", "muted"))
+        auto_row.addStretch()
+        self.llm_auto_switch = SwitchControl("Вручную", "Авто")
+        self.llm_auto_switch.setToolTip(
+            "Включите, чтобы Qwen запускалась автоматически после завершения анализа видео"
+        )
+        auto_row.addWidget(self.llm_auto_switch)
+        llm_layout.addLayout(auto_row)
+
+        if qd is None:
+            self.llm_module_status = label(
+                f"Модуль Qwen не подключён: {QD_IMPORT_ERROR or 'qwen_describer.py не найден'}",
+                "smallMuted",
+            )
+        else:
+            self.llm_module_status = label(
+                "Модуль qwen_describer.py подключён", "smallMuted"
+            )
+        self.llm_module_status.setWordWrap(True)
+        llm_layout.addWidget(self.llm_module_status)
+        root.addWidget(llm_card)
         root.addStretch(1)
 
         bottom = QHBoxLayout()
@@ -2143,6 +2527,7 @@ class PageSettings(QWidget):
     def set_theme(self, theme):
         light = theme == "light"
         self.theme_switch.set_theme(theme)
+        self.llm_auto_switch.set_theme(theme)
         page_bg = "#F1F5F9" if light else "#0B1018"
         card_bg = "#FFFFFF" if light else "#111925"
         text = "#20384E" if light else "#E7ECF5"
@@ -2162,6 +2547,35 @@ class PageSettings(QWidget):
                     f"QFrame#{card.objectName()} {{ background:{card_bg}; "
                     f"border:1px solid {'#D7E1EB' if light else '#253144'}; border-radius:12px; }}"
                 )
+
+    def _browse_llm_dir(self):
+        dialog = QFileDialog(self, "Папка с локальной моделью Qwen")
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        dialog.setWindowModality(Qt.WindowModal)
+        if dialog.exec_() == QFileDialog.Accepted:
+            selected = dialog.selectedFiles()
+            if selected:
+                self.llm_model_combo.setCurrentText(selected[0])
+
+    def llm_config(self) -> dict:
+        return {
+            "model": self.llm_model_combo.currentText().strip(),
+            "device": self.llm_device_combo.currentData() or "auto",
+            "tokens": int(self.llm_tokens_spin.value()),
+            "auto": self.llm_auto_switch.isChecked(),
+        }
+
+    def set_llm_config(self, cfg: dict):
+        if cfg.get("model"):
+            self.llm_model_combo.setCurrentText(str(cfg["model"]))
+        index = self.llm_device_combo.findData(cfg.get("device", "auto"))
+        self.llm_device_combo.setCurrentIndex(max(0, index))
+        self.llm_tokens_spin.setValue(int(cfg.get("tokens", 700)))
+        self.llm_auto_switch.blockSignals(True)
+        self.llm_auto_switch.setChecked(bool(cfg.get("auto", False)))
+        self.llm_auto_switch.blockSignals(False)
 
     def _browse_weights(self):
         path, _ = QFileDialog.getOpenFileName(self, "Выберите веса YOLO", "", "Веса модели (*.pt);;Все файлы (*.*)")
@@ -2220,6 +2634,18 @@ class MainWindow(QMainWindow):
         self.loaded_accident_weights = ""
         self.loaded_road_weights = ""
         self._analysis_error = ""
+
+        self.describer = None
+        self.desc_thread = None
+        self.llm_json_path = ""
+        self.description_text = ""
+        self.description_for = ""
+        self._llm_request_id = 0
+        self._active_llm_token = None
+        self._active_llm_path = ""
+        self._auto_attempted_for = ""
+        self._pending_analysis_config = None
+        self._close_when_llm_done = False
 
         root = QWidget()
         root.setObjectName("root")
@@ -2312,8 +2738,15 @@ class MainWindow(QMainWindow):
 
         self.page_new.start_analysis.connect(self._start_processing)
         self.page_proc.stop_clicked.connect(self._stop_processing)
+        self.page_res.generate_requested.connect(self._start_description)
+        self.page_res.stop_generation_requested.connect(self._stop_description)
         self.page_set.apply_requested.connect(self._apply_model_settings)
         self.page_set.theme_changed.connect(self._apply_theme)
+        self.page_res.set_llm_available(
+            qd is not None,
+            (f"Не удалось подключить qwen_describer.py: {QD_IMPORT_ERROR}" if qd is None else ""),
+        )
+        self._load_llm_settings()
         self.page_set.theme_switch.blockSignals(True)
         self.page_set.theme_switch.setChecked(self.current_theme == "dark")
         self.page_set.theme_switch.blockSignals(False)
@@ -2379,6 +2812,7 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.page_res)
             self._set_nav(1)
             self.page_res.stop_playback()
+            self._after_results_shown()
         elif index == 0:
             self.stack.setCurrentWidget(self.page_new)
             self._set_nav(0)
@@ -2467,6 +2901,23 @@ class MainWindow(QMainWindow):
         if self._analysis_is_running():
             self._show_processing_page(notify=True)
             return
+        if self.desc_thread is not None and self.desc_thread.isRunning():
+            self._pending_analysis_config = dict(config)
+            self._invalidate_description()
+            self.page_res.llm_status_message(
+                "Qwen остановится, после чего автоматически начнётся новый анализ."
+            )
+            self.statusBar().showMessage("Останавливаю Qwen перед новым анализом…")
+            return
+        self._invalidate_description()
+        self._pending_analysis_config = None
+        self.llm_json_path = ""
+        self.description_text = ""
+        self.description_for = ""
+        self._auto_attempted_for = ""
+        # Сбросить сигнатуру, чтобы повторный анализ того же файла с тем же
+        # числом кадров всё равно обновил видео, сводку и блок Qwen.
+        self.page_res._last_results_signature = None
         self.all_records.clear()
         self.analysis_data = {}
         self.last_frame = None
@@ -2507,10 +2958,15 @@ class MainWindow(QMainWindow):
         self.page_proc.btn_stop.setEnabled(False)
         if self.video_thread:
             self.analysis_data = self.video_thread.analysis_data or {}
+            candidate_llm_json = getattr(self.video_thread, "llm_json", "") or ""
+            self.llm_json_path = (
+                candidate_llm_json if candidate_llm_json and Path(candidate_llm_json).is_file() else ""
+            )
             if self.video_thread.result_json:
-                self.statusBar().showMessage(
-                    f"Сохранены {Path(self.video_thread.result_json).name} и {Path(self.video_thread.llm_json).name}", 7000
-                )
+                saved_names = [Path(self.video_thread.result_json).name]
+                if self.llm_json_path:
+                    saved_names.append(Path(self.llm_json_path).name)
+                self.statusBar().showMessage("Сохранены: " + " и ".join(saved_names), 7000)
         if self.all_records:
             if self._analysis_error:
                 self.page_proc.fail_stage()
@@ -2543,6 +2999,214 @@ class MainWindow(QMainWindow):
             self._set_nav(0)
             self.stack.setCurrentWidget(self.page_new)
 
+    # ---- Qwen2.5: настройки, кэш и генерация описания ---------------------
+    def _load_llm_settings(self):
+        try:
+            tokens = int(self.settings.value("llm/tokens", 700))
+        except (TypeError, ValueError):
+            tokens = 700
+        self.page_set.set_llm_config({
+            "model": self.settings.value(
+                "llm/model", qd.DEFAULT_MODEL if qd else "Qwen/Qwen2.5-1.5B-Instruct"
+            ),
+            "device": self.settings.value("llm/device", "auto"),
+            "tokens": tokens,
+            "auto": str(self.settings.value("llm/auto", "false")).lower()
+                    in ("true", "1", "yes"),
+        })
+
+    def _save_llm_settings(self):
+        cfg = self.page_set.llm_config()
+        self.settings.setValue("llm/model", cfg["model"])
+        self.settings.setValue("llm/device", cfg["device"])
+        self.settings.setValue("llm/tokens", cfg["tokens"])
+        self.settings.setValue("llm/auto", "true" if cfg["auto"] else "false")
+
+    def _after_results_shown(self):
+        path = self.llm_json_path
+        if not path or qd is None:
+            if not path:
+                self.page_res.llm_status_message(
+                    "Сводка result_llm.json не найдена. Проверьте, что main.py создаёт digest для Qwen."
+                )
+            return
+        if not Path(path).is_file():
+            self.page_res.llm_status_message(
+                f"Файл сводки для Qwen не найден: {Path(path).name}"
+            )
+            return
+        if self.desc_thread is not None and self.desc_thread.isRunning():
+            return
+        if self.description_for == path and self.description_text:
+            if not self.page_res._llm_text:
+                self.page_res.llm_finish(self.description_text, cached=True)
+            return
+        try:
+            cached = qd.read_cached(path)
+        except Exception:
+            cached = None
+        if cached:
+            self.description_text = cached
+            self.description_for = path
+            self.page_res.llm_finish(cached, cached=True)
+            return
+        cfg = self.page_set.llm_config()
+        if cfg["auto"] and self._auto_attempted_for != path:
+            self._auto_attempted_for = path
+            self._start_description()
+
+    def _start_description(self):
+        if qd is None:
+            self.page_res.llm_fail(
+                "Не удалось импортировать qwen_describer.py. Проверьте, что файл находится рядом с GUI."
+            )
+            return
+        if self.desc_thread is not None and self.desc_thread.isRunning():
+            self.page_res.llm_status_message(
+                "Предыдущая генерация ещё завершается. Дождитесь её остановки и повторите запуск."
+            )
+            return
+        path = self.llm_json_path
+        if not path or not Path(path).is_file():
+            self.page_res.llm_fail(
+                "Нет result_llm.json. Сначала завершите анализ видео и проверьте создание сводки в main.py."
+            )
+            return
+        try:
+            digest = qd.load_digest(path)
+            if not isinstance(digest, dict):
+                raise ValueError("Сводка должна быть JSON-объектом")
+        except Exception as exc:
+            self.page_res.llm_fail(f"Не удалось прочитать сводку: {exc}")
+            return
+
+        cfg = self.page_set.llm_config()
+        if not cfg["model"]:
+            self.page_res.llm_fail("Выберите модель Qwen в настройках.")
+            return
+        self._save_llm_settings()
+
+        if self.describer is None or not self.describer.matches(cfg["model"], cfg["device"]):
+            if self.describer is not None:
+                try:
+                    self.describer.unload()
+                except Exception:
+                    pass
+            self.describer = qd.QwenDescriber(cfg["model"], cfg["device"])
+
+        # Сбрасываем флаг отмены ДО старта потока. Сам describe() его уже не сбрасывает,
+        # поэтому быстрый клик «Остановить» не потеряется из-за гонки запуска.
+        if hasattr(self.describer, "reset_cancel"):
+            self.describer.reset_cancel()
+        else:
+            # Совместимость с предыдущим qwen_describer.py.
+            try:
+                self.describer._cancel.clear()
+            except Exception:
+                pass
+
+        self._llm_request_id += 1
+        token = self._llm_request_id
+        self._active_llm_token = token
+        self._active_llm_path = path
+        self._auto_attempted_for = path
+        self.page_res.llm_set_busy(
+            "Подготовка запроса…" if self.describer.loaded else "Загрузка модели Qwen…"
+        )
+        worker = DescriptionThread(
+            self.describer, digest, lang="ru", max_new_tokens=cfg["tokens"], parent=self
+        )
+        self.desc_thread = worker
+        worker.status.connect(
+            lambda message, request_id=token: self._on_llm_status(message, request_id)
+        )
+        worker.text_chunk.connect(
+            lambda chunk, request_id=token: self._on_llm_chunk(chunk, request_id)
+        )
+        worker.done.connect(
+            lambda text, cancelled, request_id=token, source_path=path:
+                self._on_llm_done(text, cancelled, request_id, source_path)
+        )
+        worker.failed.connect(
+            lambda message, request_id=token:
+                self._on_llm_failed(message, request_id)
+        )
+        worker.finished.connect(
+            lambda finished_worker=worker: self._on_description_thread_finished(finished_worker)
+        )
+        worker.start()
+        self.statusBar().showMessage("Qwen составляет описание видео…")
+
+    def _on_llm_status(self, message, request_id):
+        if request_id == self._llm_request_id:
+            self.page_res.llm_status_message(message)
+
+    def _on_llm_chunk(self, chunk, request_id):
+        if request_id == self._llm_request_id:
+            self.page_res.llm_append(chunk)
+
+    def _on_llm_done(self, text, cancelled, request_id, source_path):
+        if request_id != self._llm_request_id or source_path != self.llm_json_path:
+            return  # устаревшая генерация: не показываем и не сохраняем к другому видео
+        text = qd.clean_text(text) if (qd is not None and text) else text
+        self.page_res.llm_finish(text, cancelled=cancelled)
+        if text and not cancelled:
+            try:
+                qd.save_description(source_path, text)
+            except OSError as exc:
+                self.page_res.llm_status_message(
+                    f"Описание готово, но не удалось сохранить TXT: {exc}"
+                )
+            self.description_text = text
+            self.description_for = source_path
+            self.statusBar().showMessage("Описание видео готово", 5000)
+        else:
+            self.statusBar().showMessage(
+                "Генерация описания остановлена" if cancelled else "Qwen не вернула текст", 4000
+            )
+
+    def _on_llm_failed(self, message, request_id):
+        if request_id != self._llm_request_id:
+            return
+        self.page_res.llm_fail(message)
+        self.statusBar().showMessage("Не удалось создать описание", 5000)
+        hint = ""
+        if "No module named" in message:
+            hint = "\n\nУстановите зависимости: pip install torch transformers accelerate"
+        elif any(word in message.lower() for word in ("connect", "offline", "resolve", "network")):
+            hint = (
+                "\n\nПохоже, нет доступа к Hugging Face. Проверьте интернет "
+                "или выберите локальную папку модели в настройках."
+            )
+        QMessageBox.warning(self, "Не удалось создать описание", message + hint)
+
+    def _stop_description(self):
+        if self.desc_thread is not None and self.desc_thread.isRunning():
+            if self.describer is not None:
+                self.describer.cancel()
+            self.page_res.llm_status_message(
+                "Остановка Qwen… модель может завершить текущую загрузку перед остановкой."
+            )
+
+    def _invalidate_description(self):
+        """Отменяет текущую генерацию и делает её результаты устаревшими."""
+        self._llm_request_id += 1
+        self._active_llm_token = None
+        self._active_llm_path = ""
+        if self.desc_thread is not None and self.desc_thread.isRunning():
+            if self.describer is not None:
+                self.describer.cancel()
+
+    def _on_description_thread_finished(self, worker):
+        if self.desc_thread is worker:
+            self.desc_thread = None
+        if self._pending_analysis_config is not None:
+            pending = self._pending_analysis_config
+            self._pending_analysis_config = None
+            QTimer.singleShot(0, lambda config=pending: self._start_processing(config))
+        if self._close_when_llm_done:
+            QTimer.singleShot(0, self.close)
+
     def _stop_processing(self):
         if self.video_thread and self.video_thread.isRunning():
             self.page_proc.lbl_status.setText("Остановка обработки…")
@@ -2555,8 +3219,18 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, lambda: self._show_processing_page(notify=False))
 
     def closeEvent(self, event):
+        if self.desc_thread is not None and self.desc_thread.isRunning():
+            self._close_when_llm_done = True
+            self._pending_analysis_config = None
+            self._invalidate_description()
+            self.page_res.llm_status_message(
+                "Завершаю поток Qwen перед закрытием приложения…"
+            )
+            event.ignore()
+            return
         if self.video_thread and self.video_thread.isRunning():
             self.video_thread.stop()
+        self._save_llm_settings()
         if self.model_thread and self.model_thread.isRunning():
             self.model_thread.wait(3000)
         self.page_res.close_video()
